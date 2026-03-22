@@ -13,7 +13,15 @@ echo ""
 
 # 1. Python environment (venv)
 VENV_DIR="$PROJECT_ROOT/.venv"
-PYTHON_BIN="$VENV_DIR/bin/python"
+
+# Detect OS and set appropriate bin directory
+if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "win32" ]]; then
+    PYTHON_BIN="$VENV_DIR/Scripts/python.exe"
+    PIP_BIN="$VENV_DIR/Scripts/pip.exe"
+else
+    PYTHON_BIN="$VENV_DIR/bin/python"
+    PIP_BIN="$VENV_DIR/bin/pip"
+fi
 
 echo "[1/6] Setting up Python environment..."
 
@@ -50,14 +58,20 @@ else
     VENV_JUST_CREATED=0
 fi
 
-export PATH="$VENV_DIR/bin:$PATH"
+# Add venv to PATH based on OS
+if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "win32" ]]; then
+    export PATH="$VENV_DIR/Scripts:$PATH"
+else
+    export PATH="$VENV_DIR/bin:$PATH"
+fi
+
 echo "  Python: $($PYTHON_BIN --version)"
 echo "  Using: $PYTHON_BIN"
 
 # 2. Install dependencies (on first create or --force-install)
 echo "[2/6] Installing Python dependencies..."
 if [ "$VENV_JUST_CREATED" -eq 1 ] || [ "$1" = "--force-install" ]; then
-    $PYTHON_BIN -m pip install -q -r requirements.txt
+    $PIP_BIN install -q -r requirements.txt
     echo "  Dependencies installed."
 else
     echo "  Skipped (venv exists). Use 'bash init.sh --force-install' to reinstall."
