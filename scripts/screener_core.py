@@ -173,8 +173,12 @@ class TushareScreener:
         """Lazy-initialize Tushare pro API."""
         if self._pro is None:
             import tushare as ts
+            from config import get_api_url
             ts.set_token(self._token)
             self._pro = ts.pro_api(timeout=30)
+            api_url = get_api_url()
+            if api_url:
+                self._pro._DataApi__http_url = api_url
         return self._pro
 
     def _safe_call(self, api_name: str, **kwargs) -> pd.DataFrame:

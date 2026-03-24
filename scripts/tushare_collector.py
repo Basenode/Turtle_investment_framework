@@ -1607,6 +1607,11 @@ class TushareClient:
             latest_period = df["end_date"].max()
             df = df[df["end_date"] == latest_period]
 
+        # Deduplicate by bz_item (keep first occurrence with highest revenue)
+        if "bz_item" in df.columns and "bz_sales" in df.columns:
+            df = df.sort_values("bz_sales", ascending=False, na_position="last")
+            df = df.drop_duplicates(subset=["bz_item"], keep="first")
+
         headers = ["业务名称", "营业收入 (百万元)", "营业利润 (百万元)", "毛利率 (%)"]
         rows = []
         for _, r in df.iterrows():
