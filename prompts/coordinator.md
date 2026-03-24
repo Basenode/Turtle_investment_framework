@@ -441,7 +441,7 @@ Phase 2A (处理全部 PDF)
 | Phase 1 财报数据不足5年 | 继续执行，在 data_pack 中标注实际覆盖年份 |
 | Phase 2 Step A PDF 无法解析 | 跳过 Phase 2，Phase 3 使用降级方案 |
 | Phase 2 关键词未命中 | 对应项返回 null，data_pack_report 标注 Warning |
-| Phase 3 某因子触发否决 | 按框架规则停止后续因子，输出否决报告 |
+| Phase 3 某因子触发否决 | 标注否决原因，继续完成因子1B深度定性分析，输出完整报告 |
 | Phase 3 context 接近上限 | 通过 checkpoint 机制已将中间结果持久化到文件 |
 | Phase 1 warnings 非空 | Phase 3 读取 warnings 区块，影响分析策略 |
 

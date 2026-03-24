@@ -32,6 +32,33 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from config import get_token, get_api_url, validate_stock_code, check_local_pdf
+import tushare as ts
+
+
+def get_company_name(ts_code: str) -> str:
+    """Fetch company name from Tushare stock_basic API.
+    
+    Args:
+        ts_code: Stock code (e.g., '600096.SH', '00700.HK')
+    
+    Returns:
+        Company name string, or empty string if not found
+    """
+    try:
+        token = get_token()
+        pro = ts.pro_api(token)
+        
+        if ts_code.endswith('.HK'):
+            df = pro.hk_basic(ts_code=ts_code, fields='ts_code,name')
+        else:
+            df = pro.stock_basic(ts_code=ts_code, fields='ts_code,name')
+        
+        if not df.empty and 'name' in df.columns:
+            return str(df.iloc[0]['name'])
+    except Exception as e:
+        print(f"  [WARN] 获取公司名称失败: {e}")
+    
+    return ""
 
 
 def copy_local_pdf(local_path: str, output_dir: Path, ts_code: str, year: int = None) -> tuple[bool, str]:
@@ -353,14 +380,52 @@ def run_phase2a(pdf_path: str, output_dir: Path) -> tuple[bool, str]:
         return False, str(e)
 
 
-def create_output_dir(ts_code: str, company_name: str = None) -> Path:
+def find_existing_output_dir(ts_code: str, company_name: str = None) -> Path:
+    """Find existing output directory for the given stock.
+    
+    Checks multiple naming conventions to enable data reuse:
+    1. {代码}_{公司} (current standard): output/600989SH_宝丰能源
+    2. {公司}_{代码} (legacy format): output/宝丰能源_600989SH
+    3. {代码} (minimal format): output/600989SH
+    
+    Returns the first existing directory, or None if not found.
+    """
+    code = ts_code.replace(".", "")
+    output_root = PROJECT_ROOT / "output"
+    
+    candidates = []
+    if company_name:
+        candidates.append(f"{code}_{company_name}")
+        candidates.append(f"{company_name}_{code}")
+    candidates.append(code)
+    candidates.append(ts_code.replace(".", "_"))
+    
+    for dir_name in candidates:
+        candidate_path = output_root / dir_name
+        if candidate_path.exists() and candidate_path.is_dir():
+            return candidate_path
+    
+    return None
+
+
+def create_output_dir(ts_code: str, company_name: str = None, reuse_existing: bool = True) -> Path:
     """Create output directory for analysis results.
     
     Follows coordinator.md convention:
     {output_dir} = {workspace}/output/{代码}_{公司}
-    Example: output/600887_伊利股份
+    Example: output/600989SH_宝丰能源
+    
+    If reuse_existing=True, first checks for existing directories with different
+    naming conventions to enable data reuse across sessions.
     """
     code = ts_code.replace(".", "")
+    
+    if reuse_existing:
+        existing_dir = find_existing_output_dir(ts_code, company_name)
+        if existing_dir:
+            print(f"  [INFO] 复用已有目录: {existing_dir}")
+            return existing_dir
+    
     if company_name:
         dir_name = f"{code}_{company_name}"
     else:
@@ -645,7 +710,16 @@ Examples:
     print(f"   股票代码: {ts_code}")
     print(f"   持股渠道: {args.channel}")
     
-    output_dir = create_output_dir(ts_code, args.company)
+    company_name = args.company
+    if not company_name:
+        print("  [INFO] 正在获取公司名称...")
+        company_name = get_company_name(ts_code)
+        if company_name:
+            print(f"  [INFO] 公司名称: {company_name}")
+        else:
+            print("  [WARN] 未能获取公司名称，将使用代码作为目录名")
+    
+    output_dir = create_output_dir(ts_code, company_name)
     
     print(f"   输出目录: {output_dir}")
     
@@ -713,7 +787,7 @@ Examples:
     # Generate structured Agent tasks
     tasks = generate_agent_tasks(
         ts_code, output_dir, has_pdf, pdf_path,
-        company_name=args.company, channel=args.channel
+        company_name=company_name, channel=args.channel
     )
     
     # Write tasks to JSON file for programmatic consumption

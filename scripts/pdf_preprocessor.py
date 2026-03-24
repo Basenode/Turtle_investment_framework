@@ -77,6 +77,26 @@ SECTION_KEYWORDS: Dict[str, List[str]] = {
         "關聯交易",
         "關聯方及關聯交易",
     ],
+    "P5": [
+        # Simplified Chinese - 主要客户与供应商
+        "主要客户",
+        "前五名客户",
+        "前五大客户",
+        "客户集中度",
+        "主要供应商",
+        "前五名供应商",
+        "前五大供应商",
+        "供应商集中度",
+        "向前五名客户",
+        "向前五名供应商",
+        "主要销售客户",
+        "主要采购供应商",
+        # Traditional Chinese
+        "主要客戶",
+        "前五名客戶",
+        "主要供應商",
+        "前五名供應商",
+    ],
     "P6": [
         # Simplified Chinese
         "或有负债",
@@ -91,6 +111,40 @@ SECTION_KEYWORDS: Dict[str, List[str]] = {
         "或有事項",
         "未決訴訟",
         "承諾及或有事項",
+    ],
+    "P7": [
+        # Simplified Chinese - 成本结构
+        "成本分析",
+        "主营业务成本",
+        "营业成本构成",
+        "成本构成",
+        "成本结构",
+        "主要产品成本",
+        "成本明细",
+        "成本构成情况",
+        # Traditional Chinese
+        "成本分析",
+        "主營業務成本",
+        "營業成本構成",
+    ],
+    "P8": [
+        # Simplified Chinese - 收入结构与业务模式
+        "主营业务分析",
+        "营业收入分析",
+        "收入构成",
+        "主营业务收入",
+        "分产品收入",
+        "分行业收入",
+        "分地区收入",
+        "收入来源",
+        "业务模式",
+        "盈利模式",
+        "核心竞争力",
+        # Traditional Chinese
+        "主營業務分析",
+        "營業收入分析",
+        "收入構成",
+        "主營業務收入",
     ],
     "P13": [
         # Simplified Chinese - specific (prefer these for supplement zone)
@@ -172,7 +226,10 @@ SECTION_ZONE_PREFERENCES: Dict[str, Dict[str, List[str]]] = {
     "P2":  {"prefer": ["NOTES_ZONE"], "avoid": ["POLICY_ZONE"]},
     "P3":  {"prefer": ["NOTES_ZONE"], "avoid": ["POLICY_ZONE"]},
     "P4":  {"prefer": ["NOTES_ZONE"], "avoid": ["POLICY_ZONE"]},
+    "P5":  {"prefer": ["MDA_ZONE", "NOTES_ZONE"], "avoid": ["POLICY_ZONE"]},
     "P6":  {"prefer": ["NOTES_ZONE"], "avoid": ["POLICY_ZONE"]},
+    "P7":  {"prefer": ["MDA_ZONE", "NOTES_ZONE"], "avoid": ["POLICY_ZONE"]},
+    "P8":  {"prefer": ["MDA_ZONE", "NOTES_ZONE"], "avoid": ["POLICY_ZONE"]},
     "P13": {"prefer": ["SUPPLEMENT_ZONE", "NOTES_ZONE"], "avoid": ["POLICY_ZONE"]},
     "MDA": {"prefer": ["MDA_ZONE"], "avoid": ["NOTES_ZONE", "FIN_ZONE", "POLICY_ZONE", "SUPPLEMENT_ZONE"]},
     "SUB": {"prefer": ["NOTES_ZONE"], "avoid": ["POLICY_ZONE"]},
@@ -639,7 +696,7 @@ def write_output(
         },
     }
 
-    for section_id in ["P2", "P3", "P4", "P6", "P13", "MDA", "SUB"]:
+    for section_id in ["P2", "P3", "P4", "P5", "P6", "P7", "P8", "P13", "MDA", "SUB"]:
         output[section_id] = contexts.get(section_id)
 
     # Ensure output directory exists
