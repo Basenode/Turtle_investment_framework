@@ -25,6 +25,8 @@ try:
 except ImportError:
     _yf_available = False
 
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 from config import get_token, get_api_url, validate_stock_code
 from format_utils import format_number, format_table, format_header
 
@@ -168,7 +170,7 @@ class TushareClient:
         self.token = token
         self._store = {}  # {key: pd.DataFrame} for derived metrics computation
         self._yf_available = _yf_available
-        self._cache_dir = os.path.join("output", ".collector_cache")
+        self._cache_dir = os.path.join(_PROJECT_ROOT, "output", ".collector_cache")
         # Broker API support: route calls through custom URL + enable VIP endpoints
         api_url = get_api_url()
         self._vip_mode = bool(api_url)
@@ -456,6 +458,8 @@ class TushareClient:
         if df.empty:
             return df, []
 
+        df = df.copy()
+        df["end_date"] = df["end_date"].astype(str)
         df = df.drop_duplicates(subset=["end_date"])
 
         # Split into annual (1231) and non-annual
@@ -616,6 +620,9 @@ class TushareClient:
         high_date = df.loc[df["high"].idxmax(), "trade_date"]
         low_date = df.loc[df["low"].idxmin(), "trade_date"]
         avg_vol = df["vol"].mean()
+
+        # Store for derived metrics
+        self._store["daily_quote"] = df
 
         table = format_table(
             ["指标", "数值"],
@@ -1175,7 +1182,18 @@ class TushareClient:
     # --- Feature #21: Section 6 — Dividend history ---
 
     def get_dividends(self, ts_code: str) -> str:
-        """Section 6: Dividend history."""
+        """Section 6: Dividend history.
+        
+        显示三个维度：
+        1. 按会计年度（end_date）显示分红明细（区分中期/年度）
+        2. 按自然年度（除权日年份）汇总实际实施的分红
+        3. 计算正确的分红率（证监会口径：年度总分红/年度净利润）
+        
+        口径说明：
+        - 中期分红率 = 中期分红 / 全年归母净利润（非上半年净利润）
+        - 年度分红率 = 年度总分红（中期+末期） / 全年归母净利润
+        - TTM股息率 = 过去12个月已实施分红 / 当前股价
+        """
         if self._is_hk(ts_code):
             return self._get_dividends_hk(ts_code)
 
@@ -1190,37 +1208,160 @@ class TushareClient:
             return "\n".join(lines)
 
         # Filter for completed dividends
-        df = df[df["div_proc"] == "实施"].copy()
-        df = df.drop_duplicates(subset=["end_date"])
-        df = df.sort_values("end_date", ascending=False).head(5)
+        df_impl = df[df["div_proc"] == "实施"].copy()
+        
+        # 获取净利润数据用于计算分红率
+        income_df = self._get_annual_df("income")
+        np_lookup = {}
+        if not income_df.empty:
+            for _, r in income_df.iterrows():
+                year = str(r["end_date"])[:4]
+                np_val = self._safe_float(r.get("n_income_attr_p"))
+                if np_val is not None and np_val > 0:
+                    np_lookup[year] = np_val / 1e6
+        
+        # Fallback: 直接从存储中获取（使用原始格式）
+        if not np_lookup:
+            income_raw = self._store.get("income")
+            if income_raw is not None and not income_raw.empty:
+                for _, r in income_raw.iterrows():
+                    end_date_raw = r.get("end_date", "")
+                    end_date = str(end_date_raw) if end_date_raw is not None else ""
+                    if end_date.endswith("1231"):
+                        year = end_date[:4]
+                        np_val = self._safe_float(r.get("n_income_attr_p"))
+                        if np_val is not None and np_val > 0:
+                            np_lookup[year] = np_val / 1e6
+        
+        # Fallback 2: 从母公司利润表获取
+        if not np_lookup:
+            income_parent_raw = self._store.get("income_parent")
+            if income_parent_raw is not None and not income_parent_raw.empty:
+                for _, r in income_parent_raw.iterrows():
+                    end_date_raw = r.get("end_date", "")
+                    end_date = str(end_date_raw) if end_date_raw is not None else ""
+                    if end_date.endswith("1231"):
+                        year = end_date[:4]
+                        np_val = self._safe_float(r.get("n_income_attr_p"))
+                        if np_val is not None and np_val > 0:
+                            np_lookup[year] = np_val / 1e6
 
+        # 按会计年度分组，区分中期和年度
+        df_impl["end_date_str"] = df_impl["end_date"].astype(str)
+        df_impl["fiscal_year"] = df_impl["end_date_str"].str[:4]
+        df_impl["is_interim"] = df_impl["end_date_str"].str[4:6] == "06"
+        
         # Store for derived metrics
-        self._store["dividends"] = df
+        self._store["dividends_raw"] = df_impl.copy()
 
-        if df.empty:
+        if df_impl.empty:
             lines.append("暂无已实施分红\n")
             return "\n".join(lines)
 
-        headers = ["年度", "每股现金分红(税前)", "每股送股", "登记日", "除权日", "总分红 (百万元)"]
+        # 表1：按会计年度显示分红明细（区分中期/年度）
+        lines.append("#### 按会计年度（分红方案归属年度）")
+        lines.append("")
+        headers = ["会计年度", "类型", "每股现金分红(税前)", "登记日", "除权日", "总分红(百万元)", "分红率"]
         rows = []
-        for _, r in df.iterrows():
-            year = str(r.get("end_date", ""))[:4]
-            cash_div = r.get("cash_div_tax", 0) or 0
-            stk_div = r.get("stk_div", 0) or 0
-            base_share = r.get("base_share", 0) or 0
-            total_div = cash_div * base_share * 10000  # base_share is 万股, convert to shares
-            rows.append([
-                year,
-                f"{cash_div:.4f}",
-                f"{stk_div:.2f}" if stk_div else "—",
-                str(r.get("record_date", "—")),
-                str(r.get("ex_date", "—")),
-                format_number(total_div),
-            ])
+        
+        # 按会计年度分组汇总
+        fiscal_years = sorted(df_impl["fiscal_year"].unique(), reverse=True)[:5]
+        for fy in fiscal_years:
+            fy_df = df_impl[df_impl["fiscal_year"] == fy]
+            for _, r in fy_df.iterrows():
+                div_type = "中期" if r.get("is_interim") else "年度"
+                cash_div = r.get("cash_div_tax", 0) or 0
+                base_share = r.get("base_share", 0) or 0
+                total_div = cash_div * base_share * 10000 / 1000000  # 转百万元
+                
+                # 计算分红率（用对应会计年度的净利润）
+                np_val = np_lookup.get(fy, 0)
+                payout = (total_div / np_val * 100) if np_val > 0 else 0
+                
+                rows.append([
+                    fy,
+                    div_type,
+                    f"{cash_div:.4f}",
+                    str(r.get("record_date", "—")),
+                    str(r.get("ex_date", "—")),
+                    f"{total_div:.2f}",
+                    f"{payout:.2f}%" if payout > 0 else "—",
+                ])
 
         table = format_table(headers, rows,
-                             alignments=["l", "r", "r", "l", "l", "r"])
+                             alignments=["l", "l", "r", "l", "l", "r", "r"])
         lines.append(table)
+        lines.append("")
+        
+        # 表2：按自然年度（除权日年份）汇总实际实施分红
+        lines.append("#### 按自然年度（实际除权年份）")
+        lines.append("")
+        df_impl["ex_year"] = df_impl["ex_date"].astype(str).str[:4]
+        df_by_ex_year = df_impl.groupby("ex_year").agg({
+            "cash_div_tax": "sum",
+            "stk_div": "sum",
+            "base_share": "first",
+        }).reset_index()
+        df_by_ex_year = df_by_ex_year.sort_values("ex_year", ascending=False).head(5)
+        
+        headers2 = ["自然年度", "累计每股分红(税前)", "分红次数", "总分红(百万元)"]
+        rows2 = []
+        for _, r in df_by_ex_year.iterrows():
+            ex_year = r["ex_year"]
+            cash_div = r.get("cash_div_tax", 0) or 0
+            base_share = r.get("base_share", 0) or 0
+            count = len(df_impl[df_impl["ex_year"] == ex_year])
+            total_div = cash_div * base_share * 10000 / 1000000
+            rows2.append([
+                ex_year,
+                f"{cash_div:.4f}",
+                str(count),
+                f"{total_div:.2f}",
+            ])
+        
+        table2 = format_table(headers2, rows2,
+                              alignments=["l", "r", "r", "r"])
+        lines.append(table2)
+        lines.append("")
+        
+        # 表3：股息率计算（TTM口径）
+        lines.append("#### 股息率计算（TTM口径）")
+        lines.append("")
+        
+        # 获取当前股价
+        quote_df = self._store.get("daily_quote")
+        latest_price = 0
+        if quote_df is not None and not quote_df.empty:
+            latest_price = self._safe_float(quote_df.iloc[0].get("close")) or 0
+        
+        # 计算TTM分红（过去12个月已实施）
+        df_impl["ex_date_dt"] = pd.to_datetime(df_impl["ex_date"], format="%Y%m%d", errors="coerce")
+        latest_date = df_impl["ex_date_dt"].max()
+        if pd.notna(latest_date):
+            ttm_start = latest_date - pd.DateOffset(years=1)
+            ttm_df = df_impl[df_impl["ex_date_dt"] >= ttm_start]
+            ttm_dps = ttm_df["cash_div_tax"].sum()
+            ttm_yield = (ttm_dps / latest_price * 100) if latest_price > 0 else 0
+        else:
+            ttm_dps = 0
+            ttm_yield = 0
+        
+        lines.append(f"| 指标 | 数值 | 口径说明 |")
+        lines.append(f"| --- | ---: | --- |")
+        lines.append(f"| TTM股息率 | {ttm_yield:.2f}% | 过去12个月已实施分红 / 当前股价 |")
+        lines.append(f"| TTM每股分红 | {ttm_dps:.4f}元 | 过去12个月已实施分红合计 |")
+        if latest_price > 0:
+            lines.append(f"| 当前股价 | {latest_price:.2f}元 | 最新收盘价 |")
+        lines.append("")
+        
+        lines.append("> **口径说明**：")
+        lines.append("> - 分红率 = 分红金额 / 对应会计年度归母净利润（证监会法定口径）")
+        lines.append("> - TTM股息率 = 过去12个月已实施分红 / 当前股价（行业通用口径）")
+        lines.append("> - 中期分红率 ≠ 公司公告的中期分红率（公司用上半年净利润，此处用全年净利润）")
+        
+        # Store for derived metrics - 使用自然年度汇总数据
+        self._store["dividends_by_ex_year"] = df_by_ex_year
+        
         return "\n".join(lines)
 
     def _get_dividends_hk(self, ts_code: str) -> str:
@@ -1641,28 +1782,32 @@ class TushareClient:
     # --- Feature #25: Section 7 (partial) — Top 10 holders + audit ---
 
     def get_holders(self, ts_code: str) -> str:
-        """Section 7 (partial): Top 10 shareholders."""
+        """Section 7: Top 10 shareholders + audit info + placeholders for Agent."""
         if self._is_hk(ts_code):
             return self._get_holders_hk(ts_code)
 
-        lines = [format_header(2, "7. 股东与治理 (部分)"), ""]
+        lines = [format_header(2, "7. 股东与治理"), ""]
 
         try:
             df = self._safe_call("top10_holders", ts_code=ts_code)
         except RuntimeError:
             lines.append("股东数据缺失\n")
+            lines.append(self._get_audit_section(ts_code))
+            lines.append(self._get_agent_placeholders("7"))
             return "\n".join(lines)
 
         if df.empty:
             lines.append("股东数据缺失\n")
+            lines.append(self._get_audit_section(ts_code))
+            lines.append(self._get_agent_placeholders("7"))
             return "\n".join(lines)
 
-        # Get latest period
         if "end_date" in df.columns:
             latest = df["end_date"].max()
             df = df[df["end_date"] == latest]
-
-        lines.append(f"*截至 {latest}*\n" if "end_date" in df.columns else "")
+            lines.append(f"*截至 {latest}*\n")
+        else:
+            latest = None
 
         headers = ["序号", "股东名称", "持股数量 (万股)", "持股比例 (%)"]
         rows = []
@@ -1677,75 +1822,17 @@ class TushareClient:
         table = format_table(headers, rows,
                              alignments=["l", "l", "r", "r"])
         lines.append(table)
-        return "\n".join(lines)
-
-    def _get_holders_hk(self, ts_code: str) -> str:
-        """Section 7 (HK): Institutional holders via yfinance."""
-        lines = [format_header(2, "7. 股东与治理 (部分)"), ""]
-
-        if not self._yf_available:
-            lines.append("数据缺失 (yfinance不可用)")
-            lines.append("")
-            lines.append("*[§7 待Agent WebSearch补充]*")
-            return "\n".join(lines)
-
-        try:
-            ticker = yf.Ticker(self._yf_ticker(ts_code))
-            major = ticker.major_holders
-            inst = ticker.institutional_holders
-        except Exception:
-            lines.append("数据缺失 (yfinance不可用)")
-            lines.append("")
-            lines.append("*[§7 待Agent WebSearch补充]*")
-            return "\n".join(lines)
-
-        # Major holders summary
-        if major is not None and not major.empty:
-            lines.append("**持股概况**\n")
-            mh_headers = ["项目", "数值"]
-            mh_rows = []
-            for _, r in major.iterrows():
-                vals = list(r)
-                if len(vals) >= 2:
-                    mh_rows.append([str(vals[1]), str(vals[0])])
-            if mh_rows:
-                lines.append(format_table(mh_headers, mh_rows, alignments=["l", "r"]))
-                lines.append("")
-
-        # Institutional holders
-        if inst is not None and not inst.empty:
-            lines.append("**主要机构持股**\n")
-            ih_headers = ["机构名称", "持股数量", "占比 (%)", "报告日期"]
-            ih_rows = []
-            for _, r in inst.head(10).iterrows():
-                name = str(r.get("Holder", "—"))
-                shares = r.get("Shares")
-                pct = r.get("pctHeld") or r.get("% Out")
-                date_val = r.get("Date Reported")
-                shares_str = format_number(shares, divider=1e4, decimals=2) if shares is not None else "—"
-                pct_str = f"{float(pct) * 100:.2f}" if pct is not None and pct == pct else "—"
-                date_str = str(date_val)[:10] if date_val is not None else "—"
-                ih_rows.append([name, shares_str, pct_str, date_str])
-            lines.append(format_table(ih_headers, ih_rows, alignments=["l", "r", "r", "l"]))
-            lines.append("")
-
-        if (major is None or major.empty) and (inst is None or inst.empty):
-            lines.append("数据缺失 (yfinance无持股数据)")
-            lines.append("")
-            lines.append("*[§7 待Agent WebSearch补充]*")
-            return "\n".join(lines)
-
-        lines.append("*数据来源: yfinance*")
         lines.append("")
-        lines.append("*[§7 待Agent WebSearch补充: 控股股东、管理层变更、违规记录等定性信息]*")
+        
+        lines.append(self._get_audit_section(ts_code))
+        lines.append(self._get_agent_placeholders("7"))
+        
         return "\n".join(lines)
 
-    def get_audit(self, ts_code: str) -> str:
-        """Audit opinion info."""
-        if self._is_hk(ts_code):
-            return format_header(3, "审计意见") + "\n\n数据缺失 (港股暂不支持)\n"
-
-        lines = [format_header(3, "审计意见"), ""]
+    def _get_audit_section(self, ts_code: str) -> str:
+        """Get audit opinion as subsection of §7."""
+        lines = ["", format_header(3, "7.1 审计意见"), ""]
+        
         try:
             df = self._safe_call("fina_audit", ts_code=ts_code,
                                  fields="ts_code,end_date,audit_result,audit_agency,audit_fees")
@@ -1775,9 +1862,129 @@ class TushareClient:
         lines.append(table)
         return "\n".join(lines)
 
+    def _get_agent_placeholders(self, section: str) -> str:
+        """Generate placeholder subsections for Agent WebSearch."""
+        placeholders = {
+            "7": [
+                ("7.2", "管理层信息", """逐项搜索并记录：
+| # | 搜索项 | 搜索关键词示例 |
+|---|--------|-------------|
+| 1 | 控股股东及持股比例 | "{公司名} 大股东 控股" |
+| 2 | CEO/董事长/CFO 姓名及任期 | "{公司名} 管理层 CEO 董事长" |
+| 3 | 过去5年管理层重大变更 | "{公司名} 管理层变更 更换" |
+| 4 | 过去5年是否更换审计师 | "{公司名} 更换审计师" |
+| 5 | 财务造假/违规/处罚记录 | "{公司名} 财务造假 处罚 证监会" |
+| 6 | 控股股东质押/减持/诉讼 | "{公司名} 大股东 质押 减持" |
+| 7 | 回购计划/授权 | "{公司名} 股份回购 计划" |
+
+> **已有 tushare 结构化数据**：
+> - 项目 1（控股股东持股比例）→ §7 十大股东已有数值
+> - 项目 6（质押/减持）→ §16 股权质押已有质押数据
+> - 项目 7（回购）→ §15 股票回购已有回购数据
+>
+> Agent 应**补充定性信息**（变更原因、具体情况、最新动态），不需要重新采集已有数值。"""),
+                ("7.3", "历史发展脉络", """| # | 搜索项 | 搜索关键词示例 |
+|---|--------|-------------|
+| 1 | 发展历程 | "{公司名} 发展历程 历史沿革" |
+| 2 | 重大并购/收购 | "{公司名} 重大收购 并购" |
+| 3 | 战略转型 | "{公司名} 战略转型 业务调整" |
+| 4 | 创始人/关键人物 | "{公司名} 创始人 背景" |"""),
+            ],
+            "8": [
+                ("8.1", "产业链定位", "| # | 搜索项 | 搜索关键词示例 |\n|---|--------|-------------|\n| 1 | 产业链图谱 | \"{行业} 产业链图谱 上中下游\" |\n| 2 | 上下游企业 | \"{公司名} 上游供应商 下游客户\" |\n| 3 | 价值链分布 | \"{行业} 价值链 利润分布\" |\n| 4 | 上下游议价能力 | \"{公司名} 议价能力 上下游\" |"),
+                ("8.2", "竞争格局", "| # | 搜索项 | 搜索关键词示例 |\n|---|--------|-------------|\n| 1 | 市场份额 | \"{行业} 市场份额 竞争格局\" |\n| 2 | 行业集中度 | \"{行业} CR5 行业集中度\" |\n| 3 | 差异化优势 | \"{公司名} 竞争优势 差异化\" |"),
+                ("8.3", "行业技术路线", "| # | 搜索项 | 搜索关键词示例 |\n|---|--------|-------------|\n| 1 | 主流技术路线 | \"{行业} 技术路线 主流技术\" |\n| 2 | 技术迭代周期 | \"{行业} 技术迭代 更新周期\" |\n| 3 | 公司技术储备 | \"{公司名} 研发投入 专利\" |\n| 4 | 新兴技术趋势 | \"{行业} 新技术 下一代技术\" |"),
+                ("8.4", "行业趋势", "| # | 搜索项 | 搜索关键词示例 |\n|---|--------|-------------|\n| 1 | 行业周期位置 | \"{行业} 周期 景气度\" |\n| 2 | 供需展望 | \"{行业} 供需 展望\" |\n| 3 | 核心原材料价格趋势 | \"{原材料} 价格走势 最新\" |"),
+                ("8.5", "行业监管动态", "| # | 搜索项 | 搜索关键词示例 |\n|---|--------|-------------|\n| 1 | 碳排放/环保政策 | \"{行业} 碳排放政策 环保监管 最新\" |\n| 2 | 安全生产监管 | \"{行业} 安全生产 监管政策 最新\" |\n| 3 | 产业政策 | \"{行业} 产业政策 发展规划 最新\" |\n| 4 | 进出口政策 | \"{行业} 进出口政策 关税 最新\" |"),
+            ],
+            "10": [
+                ("10.1", "经营回顾", "业绩亮点、核心驱动因素表格（产能释放、规模效应、成本优势、价格因素）"),
+                ("10.2", "前瞻指引", "未来战略、资本开支计划"),
+                ("10.3", "风险因素", "主要经营风险"),
+            ],
+        }
+        
+        lines = []
+        if section in placeholders:
+            for num, name, desc in placeholders[section]:
+                lines.append("")
+                lines.append(format_header(3, f"{num} {name}"))
+                lines.append("")
+                lines.append(f"*[§{num} 待Agent WebSearch补充]*")
+                lines.append("")
+                lines.append(desc)
+        
+        return "\n".join(lines)
+
+    def _get_holders_hk(self, ts_code: str) -> str:
+        """Section 7 (HK): Institutional holders via yfinance + placeholders."""
+        lines = [format_header(2, "7. 股东与治理"), ""]
+
+        if not self._yf_available:
+            lines.append("数据缺失 (yfinance不可用)")
+            lines.append("")
+            lines.append(format_header(3, "7.1 审计意见"))
+            lines.append("")
+            lines.append("数据缺失 (港股暂不支持)")
+            lines.append(self._get_agent_placeholders("7"))
+            return "\n".join(lines)
+
+        try:
+            ticker = yf.Ticker(self._yf_ticker(ts_code))
+            major = ticker.major_holders
+            inst = ticker.institutional_holders
+        except Exception:
+            lines.append("数据缺失 (yfinance不可用)")
+            lines.append("")
+            lines.append(format_header(3, "7.1 审计意见"))
+            lines.append("")
+            lines.append("数据缺失 (港股暂不支持)")
+            lines.append(self._get_agent_placeholders("7"))
+            return "\n".join(lines)
+
+        if major is not None and not major.empty:
+            lines.append("**持股概况**\n")
+            mh_headers = ["项目", "数值"]
+            mh_rows = []
+            for _, r in major.iterrows():
+                vals = list(r)
+                if len(vals) >= 2:
+                    mh_rows.append([str(vals[1]), str(vals[0])])
+            if mh_rows:
+                lines.append(format_table(mh_headers, mh_rows, alignments=["l", "r"]))
+                lines.append("")
+
+        if inst is not None and not inst.empty:
+            lines.append("**主要机构持股**\n")
+            ih_headers = ["机构名称", "持股数量", "占比 (%)", "报告日期"]
+            ih_rows = []
+            for _, r in inst.head(10).iterrows():
+                name = str(r.get("Holder", "—"))
+                shares = r.get("Shares")
+                pct = r.get("pctHeld") or r.get("% Out")
+                date_val = r.get("Date Reported")
+                shares_str = format_number(shares, divider=1e4, decimals=2) if shares is not None else "—"
+                pct_str = f"{float(pct) * 100:.2f}" if pct is not None and pct == pct else "—"
+                date_str = str(date_val)[:10] if date_val is not None else "—"
+                ih_rows.append([name, shares_str, pct_str, date_str])
+            lines.append(format_table(ih_headers, ih_rows, alignments=["l", "r", "r", "l"]))
+            lines.append("")
+
+        if (major is None or major.empty) and (inst is None or inst.empty):
+            lines.append("数据缺失 (yfinance无持股数据)")
+            lines.append("")
+        
+        lines.append("*数据来源: yfinance*")
+        lines.append("")
+        lines.append(format_header(3, "7.1 审计意见"))
+        lines.append("")
+        lines.append("数据缺失 (港股暂不支持)")
+        lines.append(self._get_agent_placeholders("7"))
+        return "\n".join(lines)
+
     # --- Feature #84: Section 14 — Risk-free rate ---
 
-    def get_risk_free_rate(self) -> str:
+    def get_risk_free_rate(self, ts_code: str = None) -> str:
         """Section 14: Risk-free rate from yc_cb (中债国债收益率曲线)."""
         lines = [format_header(2, "14. 无风险利率"), ""]
         try:
@@ -1974,6 +2181,8 @@ class TushareClient:
         df = self._store.get(store_key)
         if df is None or df.empty:
             return pd.DataFrame()
+        df = df.copy()
+        df["end_date"] = df["end_date"].astype(str)
         annual = df[df["end_date"].str.endswith("1231")].copy()
         return annual.sort_values("end_date", ascending=False)
 
@@ -2022,6 +2231,10 @@ class TushareClient:
 
         HK path: Tushare divi_ratio fix + DPS/EPS cross-validation.
         A-share path: computes from cash_div × base_share × 10000 / net_income × 100.
+        
+        口径说明（证监会法定口径）：
+        - 年度分红率 = 该会计年度所有分红（中期+末期） / 该年度归母净利润
+        - 严禁用中期分红率（中期分红/上半年净利润）替代年度分红率
         """
         # HK path: Tushare divi_ratio fix + DPS/EPS cross-validation
         hk_df = self._store.get("dividends_hk")
@@ -2049,19 +2262,36 @@ class TushareClient:
                     result[year] = resolved
             return result
 
-        # A-share path: compute from _store["dividends"] + _store["income"]
-        div_df = self._store.get("dividends")
+        # A-share path: 使用原始分红数据按会计年度汇总
+        div_raw = self._store.get("dividends_raw")
         income_df = self._get_annual_df("income")
-        if div_df is None or div_df.empty or income_df.empty:
-            return {}
+        
+        if div_raw is not None and not div_raw.empty and not income_df.empty:
+            # Build net income lookup by year
+            np_lookup = {}
+            for _, r in income_df.iterrows():
+                year = str(r["end_date"])[:4]
+                np_lookup[year] = self._safe_float(r.get("n_income_attr_p")) or 0
+            
+            # 按会计年度汇总所有分红（中期+年度）
+            result = {}
+            for fy in div_raw["fiscal_year"].unique():
+                fy_df = div_raw[div_raw["fiscal_year"] == fy]
+                total_div = 0
+                for _, r in fy_df.iterrows():
+                    cash_div = self._safe_float(r.get("cash_div_tax")) or 0
+                    base_share = self._safe_float(r.get("base_share")) or 0
+                    total_div += cash_div * base_share * 10000  # base_share is 万股
+                
+                np_val = np_lookup.get(fy, 0)
+                if total_div > 0 and np_val > 0:
+                    result[fy] = total_div / np_val * 100
+            return result
 
-        # Build dividend total lookup by year
-        div_lookup = {}
-        for _, r in div_df.iterrows():
-            year = str(r.get("end_date", ""))[:4]
-            cash_div = self._safe_float(r.get("cash_div_tax")) or 0
-            base_share = self._safe_float(r.get("base_share")) or 0
-            div_lookup[year] = cash_div * base_share * 10000  # base_share is 万股
+        # Fallback: 使用自然年度数据
+        div_by_ex_year = self._store.get("dividends_by_ex_year")
+        if div_by_ex_year is None or div_by_ex_year.empty or income_df.empty:
+            return {}
 
         # Build net income lookup by year
         np_lookup = {}
@@ -2070,10 +2300,18 @@ class TushareClient:
             np_lookup[year] = self._safe_float(r.get("n_income_attr_p"))
 
         result = {}
-        for year, div_total in div_lookup.items():
-            np_val = np_lookup.get(year)
+        for _, r in div_by_ex_year.iterrows():
+            ex_year = str(r.get("ex_year", ""))
+            if not ex_year:
+                continue
+            cash_div = self._safe_float(r.get("cash_div_tax")) or 0
+            base_share = self._safe_float(r.get("base_share")) or 0
+            div_total = cash_div * base_share * 10000  # base_share is 万股
+            
+            # 使用对应会计年度的净利润
+            np_val = np_lookup.get(ex_year)
             if div_total and np_val and np_val > 0:
-                result[year] = div_total / np_val * 100
+                result[ex_year] = div_total / np_val * 100
         return result
 
     def _compute_financial_trends(self) -> str | None:
@@ -3278,6 +3516,145 @@ class TushareClient:
 
         return "\n".join(lines)
 
+    def _build_section_13(self, ts_code: str, wc: "WarningsCollector") -> str:
+        """Build §13 风险警示 section with auto-detection and agent placeholder."""
+        lines = [format_header(2, "13. 风险警示"), ""]
+        
+        try:
+            if self._is_hk(ts_code):
+                for label, store_key in [
+                    ("合并利润表", "income"),
+                    ("合并资产负债表", "balance_sheet"),
+                    ("现金流量表", "cashflow"),
+                ]:
+                    stored = self._store.get(store_key)
+                    wc.check_missing_data(label, stored if stored is not None else pd.DataFrame())
+            else:
+                for label, api, fields in [
+                    ("合并利润表", "income", "ts_code,end_date,revenue,n_income_attr_p"),
+                    ("合并资产负债表", "balancesheet", "ts_code,end_date,total_assets"),
+                    ("现金流量表", "cashflow", "ts_code,end_date,n_cashflow_act"),
+                ]:
+                    df = self._safe_call(api, ts_code=ts_code, fields=fields)
+                    wc.check_missing_data(label, df)
+                    if not df.empty and "end_date" in df.columns:
+                        annual = df[df["end_date"].astype(str).str.endswith("1231")].copy()
+                        annual = annual.sort_values("end_date", ascending=False)
+                        annual["year"] = annual["end_date"].astype(str).str[:4]
+                        annual = annual.drop_duplicates(subset=["year"], keep="first")
+                        if not annual.empty:
+                            dates = annual["year"].tolist()
+                            for col in fields.split(",")[2:]:
+                                if col in annual.columns:
+                                    values = [v / 1e6 if v is not None and not pd.isna(v) else v for v in annual[col].tolist()]
+                                    wc.check_yoy_change(label, col, values, dates=dates)
+
+                audit_df = self._safe_call("fina_audit", ts_code=ts_code,
+                                           fields="ts_code,end_date,audit_agency,audit_result")
+                if not audit_df.empty and "audit_result" in audit_df.columns:
+                    wc.check_audit_risk(str(audit_df.iloc[0].get("audit_result", "")))
+
+            bs_df = self._store.get("balance_sheet") if self._is_hk(ts_code) else \
+                self._safe_call("balancesheet", ts_code=ts_code,
+                                fields="ts_code,end_date,goodwill,total_assets,total_liab")
+            if bs_df is not None and not bs_df.empty:
+                latest = bs_df.iloc[0]
+                gw = latest.get("goodwill", 0) or 0
+                ta = latest.get("total_assets", 0) or 0
+                tl = latest.get("total_liab", 0) or 0
+                wc.check_goodwill_ratio(float(gw), float(ta))
+                wc.check_debt_ratio(float(tl), float(ta))
+        except Exception:
+            pass
+
+        lines.append("### 13.1 脚本自动检测")
+        lines.append("")
+        
+        lines.append("#### 检测阈值配置")
+        lines.append("")
+        lines.append("| 检测项目 | 阈值 | 说明 |")
+        lines.append("|:---------|:-----|:-----|")
+        lines.append(f"| 同比变化 | ≤{WarningThresholds.YOY_CHANGE_THRESHOLD*100:.0f}% | 近{WarningThresholds.YOY_MAX_YEARS}年数据 |")
+        lines.append(f"| 商誉占比 | ≤{WarningThresholds.GOODWILL_RATIO_THRESHOLD*100:.0f}% | 商誉/总资产 |")
+        lines.append(f"| 资产负债率 | ≤{WarningThresholds.DEBT_RATIO_THRESHOLD*100:.0f}% | 负债/总资产 |")
+        lines.append(f"| 审计意见 | 标准无保留意见 | 最新年报 |")
+        lines.append(f"| 数据完整性 | 非空 | 核心报表 |")
+        lines.append("")
+        
+        lines.append("#### 检测结果汇总")
+        lines.append("")
+        if wc.check_results:
+            passed = sum(1 for r in wc.check_results if r["passed"])
+            total = len(wc.check_results)
+            lines.append(f"共检测 {total} 项，通过 {passed} 项，异常 {total - passed} 项")
+            lines.append("")
+            
+            lines.append("| 检测项 | 项目 | 年份对比 | 前值 | 当前值 | 阈值 | 实际值 | 结果 |")
+            lines.append("|:-------|:-----|:---------|-----:|-------:|:-----|:-------|:----:|")
+            for r in wc.check_results:
+                status = "✓" if r["passed"] else "⚠️"
+                period = r.get("period", "")
+                curr_val = r.get("curr_value", "")
+                prev_val = r.get("prev_value", "")
+                
+                if r["check"] == "同比变化" and curr_val != "" and prev_val != "":
+                    item = r["item"]
+                    try:
+                        curr_fmt = f"{float(curr_val):,.2f}" if curr_val else "-"
+                        prev_fmt = f"{float(prev_val):,.2f}" if prev_val else "-"
+                    except:
+                        curr_fmt = str(curr_val)
+                        prev_fmt = str(prev_val)
+                    lines.append(f"| {r['check']} | {item} | {period} | {prev_fmt} | {curr_fmt} | {r['threshold']} | {r['actual']} | {status} |")
+                else:
+                    item = f"{r['item']} ({period})" if period else r["item"]
+                    lines.append(f"| {r['check']} | {item} | — | — | — | {r['threshold']} | {r['actual']} | {status} |")
+            lines.append("")
+        
+        if wc.warnings:
+            lines.append("#### 异常警告")
+            lines.append("")
+            high = [w for w in wc.warnings if w["severity"] == "高"]
+            medium = [w for w in wc.warnings if w["severity"] == "中"]
+            low = [w for w in wc.warnings if w["severity"] == "低"]
+            for sev_label, items in [("高风险", high), ("中风险", medium), ("低风险", low)]:
+                if items:
+                    lines.append(f"**{sev_label}:**")
+                    for w in items:
+                        lines.append(f"- [{w['type']}|{w['severity']}] {w['message']}")
+                    lines.append("")
+        else:
+            lines.append("**检测结果：未发现异常**")
+            lines.append("")
+            
+        if self._is_hk(ts_code):
+            lines.append("")
+            lines.append("> 港股数据覆盖有限：§9业务构成/§15回购 暂缺，"
+                         "§16质押不适用（港股无此制度），"
+                         "§3P/§4P母公司报表在HKFRS体系下不适用，c_pay_to_staff 不可用。")
+            lines.append("")
+
+        lines.append("### 13.2 Agent WebSearch 补充")
+        lines.append("")
+        lines.append("> **必填风险类型清单**（每类至少1条）：")
+        lines.append("> - [ ] 治理风险：管理层/实控人负面事件")
+        lines.append("> - [ ] 周期风险：行业周期位置、供需变化")
+        lines.append("> - [ ] 政策风险：监管政策变化")
+        lines.append("> - [ ] 财务风险：偿债/流动性/应收等")
+        lines.append("> - [ ] 估值风险：股价位置、估值水平")
+        lines.append("")
+        lines.append("| # | 类型 | 严重程度 | 描述 |")
+        lines.append("|---|------|---------|------|")
+        lines.append("| 1 | [治理风险\\|{高/中/低}] | {严重程度} | {描述} |")
+        lines.append("| 2 | [周期风险\\|{高/中/低}] | {严重程度} | {描述} |")
+        lines.append("| 3 | [政策风险\\|{高/中/低}] | {严重程度} | {描述} |")
+        lines.append("| 4 | [财务风险\\|{高/中/低}] | {严重程度} | {描述} |")
+        lines.append("| 5 | [估值风险\\|{高/中/低}] | {严重程度} | {描述} |")
+        lines.append("")
+        lines.append("> **说明**：以上风险信息来源于公开新闻报道、监管公告和财务数据分析，供Phase 3分析时参考。")
+        
+        return "\n".join(lines)
+
     # --- Feature #28: Full data_pack_market.md assembly ---
 
     def assemble_data_pack(self, ts_code: str) -> str:
@@ -3324,15 +3701,41 @@ class TushareClient:
                 ("5. 现金流量表", self.get_cashflow),
                 ("6. 分红历史", self.get_dividends),
                 ("7. 股东与治理", self.get_holders),
+                ("8. 行业与竞争", None),  # placeholder, handled separately
                 ("9. 主营业务构成", self.get_segments),
+                ("10. 管理层讨论与分析 (MD&A)", None),  # placeholder, handled separately
                 ("11. 十年周线行情", self.get_weekly_prices),
                 ("12. 关键财务指标", self.get_fina_indicators),
+                ("13. 风险警示", None),  # auto-generated, handled separately
+                ("14. 无风险利率", self.get_risk_free_rate),
                 ("15. 股票回购", self.get_repurchase),
                 ("16. 股权质押", self.get_pledge_stat),
             ]
 
         completed = 0
+        wc = WarningsCollector()  # 初始化警告收集器，用于§13
+        
         for name, method in sections:
+            sec_num = name.split(".")[0]
+            
+            # §8 和 §10 是占位符section，由Agent WebSearch补充
+            if sec_num in ("8", "10"):
+                lines.append(format_header(2, name))
+                lines.append(self._get_agent_placeholders(sec_num))
+                lines.append("")
+                completed += 1
+                continue
+            
+            # §13 风险警示需要特殊处理
+            if sec_num == "13":
+                lines.append(self._build_section_13(ts_code, wc))
+                lines.append("")
+                completed += 1
+                continue
+            
+            # 常规section处理
+            if method is None:
+                continue
             try:
                 print(f"  Collecting {name}...")
                 section_md = method(ts_code)
@@ -3340,7 +3743,6 @@ class TushareClient:
                 lines.append("")
                 completed += 1
             except Exception as e:
-                # Attempt yfinance fallback for market data sections
                 yf_data = self._yf_fallback_price(ts_code)
                 if yf_data and name in ("1. 基本信息", "2. 市场行情"):
                     lines.append(format_header(2, name))
@@ -3355,34 +3757,6 @@ class TushareClient:
                     lines.append(format_header(2, name))
                     lines.append(f"\n数据获取失败: {e}\n")
 
-        # Audit info (sub-section of 7)
-        try:
-            audit_md = self.get_audit(ts_code)
-            lines.append(audit_md)
-            lines.append("")
-        except Exception:
-            pass
-
-        # Risk-free rate (no ts_code needed)
-        try:
-            print("  Collecting 14. 无风险利率...")
-            rf_md = self.get_risk_free_rate()
-            lines.append(rf_md)
-            lines.append("")
-        except Exception as e:
-            lines.append(format_header(2, "14. 无风险利率"))
-            lines.append(f"\n数据获取失败: {e}\n")
-
-        # Agent-only placeholder sections (§8, §10)
-        for sec_num, sec_name in [
-            ("8", "行业与竞争"),
-            ("10", "管理层讨论与分析 (MD&A)"),
-        ]:
-            lines.append(format_header(2, f"{sec_num}. {sec_name}"))
-            lines.append("")
-            lines.append(f"*[§{sec_num} 待Agent WebSearch补充]*")
-            lines.append("")
-
         # §17 Derived metrics (pre-computed from stored DataFrames)
         try:
             print("  Computing 17. 衍生指标...")
@@ -3393,91 +3767,157 @@ class TushareClient:
             lines.append(format_header(2, "17. 衍生指标（Python 预计算）"))
             lines.append(f"\n计算失败: {e}\n")
 
-        # §13 Warnings: auto-detect + agent placeholder
-        wc = WarningsCollector()
-        try:
-            if self._is_hk(ts_code):
-                # HK: use stored data instead of re-calling A-share-only APIs
-                for label, store_key in [
-                    ("合并利润表", "income"),
-                    ("合并资产负债表", "balance_sheet"),
-                    ("现金流量表", "cashflow"),
-                ]:
-                    stored = self._store.get(store_key)
-                    wc.check_missing_data(label, stored if stored is not None else pd.DataFrame())
-            else:
-                # A-share: Check missing data + YoY anomaly for core financial statements
-                for label, api, fields in [
-                    ("合并利润表", "income", "ts_code,end_date,revenue,n_income_attr_p"),
-                    ("合并资产负债表", "balancesheet", "ts_code,end_date,total_assets"),
-                    ("现金流量表", "cashflow", "ts_code,end_date,n_cashflow_act"),
-                ]:
-                    df = self._safe_call(api, ts_code=ts_code, fields=fields)
-                    wc.check_missing_data(label, df)
-                    if not df.empty and "end_date" in df.columns:
-                        # Filter to annual reports only (end_date ending in "1231")
-                        annual = df[df["end_date"].astype(str).str.endswith("1231")].copy()
-                        annual = annual.sort_values("end_date", ascending=False)
-                        if not annual.empty:
-                            dates = annual["end_date"].astype(str).str[:4].tolist()
-                            for col in fields.split(",")[2:]:  # skip ts_code, end_date
-                                if col in annual.columns:
-                                    wc.check_yoy_change(label, col, annual[col].tolist(), dates=dates)
-
-                # Audit risk check
-                audit_df = self._safe_call("fina_audit", ts_code=ts_code,
-                                           fields="ts_code,end_date,audit_agency,audit_result")
-                if not audit_df.empty and "audit_result" in audit_df.columns:
-                    wc.check_audit_risk(str(audit_df.iloc[0].get("audit_result", "")))
-
-            # Balance sheet risk checks (goodwill, debt ratio) — use stored data for HK
-            bs_df = self._store.get("balance_sheet") if self._is_hk(ts_code) else \
-                self._safe_call("balancesheet", ts_code=ts_code,
-                                fields="ts_code,end_date,goodwill,total_assets,total_liab")
-            if bs_df is not None and not bs_df.empty:
-                latest = bs_df.iloc[0]
-                gw = latest.get("goodwill", 0) or 0
-                ta = latest.get("total_assets", 0) or 0
-                tl = latest.get("total_liab", 0) or 0
-                wc.check_goodwill_ratio(float(gw), float(ta))
-                wc.check_debt_ratio(float(tl), float(ta))
-        except Exception:
-            pass  # warnings are best-effort; don't block assembly
-
-        # Build §13 with two sub-sections
-        lines.append(format_header(2, "13. 风险警示"))
-        lines.append("")
-        lines.append("### 13.1 脚本自动检测")
-        lines.append("")
-        if wc.warnings:
-            high = [w for w in wc.warnings if w["severity"] == "高"]
-            medium = [w for w in wc.warnings if w["severity"] == "中"]
-            low = [w for w in wc.warnings if w["severity"] == "低"]
-            for sev_label, items in [("高风险", high), ("中风险", medium), ("低风险", low)]:
-                if items:
-                    lines.append(f"**{sev_label}:**")
-                    for w in items:
-                        lines.append(f"- [{w['type']}|{w['severity']}] {w['message']}")
-                    lines.append("")
-        else:
-            lines.append("未检测到异常。")
-            lines.append("")
-        if self._is_hk(ts_code):
-            lines.append("")
-            lines.append("> 港股数据覆盖有限：§9业务构成/§15回购 暂缺，"
-                         "§16质押不适用（港股无此制度），"
-                         "§3P/§4P母公司报表在HKFRS体系下不适用，c_pay_to_staff 不可用。")
-            lines.append("")
-
-        lines.append("### 13.2 Agent WebSearch 补充")
-        lines.append("")
-        lines.append("*[§13.2 待Agent WebSearch补充]*")
-        lines.append("")
-
         lines.append("---")
         lines.append(f"*共 {completed}/{len(sections)} 个数据板块成功获取*")
 
         return "\n".join(lines)
+
+
+class DataPackValidator:
+    """Validate data_pack_market.md structure completeness after Agent WebSearch."""
+    
+    REQUIRED_STRUCTURE = {
+        "## 7. 股东与治理": {
+            "section_patterns": ["## 7. 股东与治理"],
+            "subsections": [
+                ("### 7.1", ["### 7.1 审计意见", "### 7.1 管理层信息"]),
+                ("### 7.2", ["### 7.2 管理层信息", "### 7.2 历史发展脉络"]),
+            ],
+            "allow_placeholder": True,
+        },
+        "## 8. 行业与竞争": {
+            "section_patterns": ["## 8. 行业与竞争"],
+            "subsections": [
+                ("### 8.1", ["### 8.1 产业链定位"]),
+                ("### 8.2", ["### 8.2 竞争格局"]),
+                ("### 8.3", ["### 8.3 行业技术路线"]),
+                ("### 8.4", ["### 8.4 行业趋势"]),
+                ("### 8.5", ["### 8.5 行业监管动态"]),
+            ],
+            "allow_placeholder": False,
+        },
+        "## 10. 管理层讨论与分析": {
+            "section_patterns": ["## 10. 管理层讨论与分析", "## 10. MD&A"],
+            "subsections": [
+                ("### 10.1", ["### 10.1 经营回顾"]),
+            ],
+            "required_content": [
+                "核心驱动因素",
+            ],
+            "allow_placeholder": False,
+        },
+        "### 13.2 Agent WebSearch 补充": {
+            "required_content": [
+                "[治理风险",
+                "[周期风险",
+                "[政策风险",
+                "[财务风险",
+                "[估值风险",
+            ],
+            "allow_placeholder": False,
+        },
+    }
+    
+    @classmethod
+    def _find_section(cls, content: str, patterns: list) -> tuple:
+        """Find section in content using multiple patterns.
+        
+        Returns:
+            Tuple of (found_section_title, start_position) or (None, -1)
+        """
+        for pattern in patterns:
+            pos = content.find(pattern)
+            if pos != -1:
+                return pattern, pos
+        return None, -1
+    
+    @classmethod
+    def validate(cls, content: str) -> list:
+        """Validate data_pack_market.md structure completeness.
+        
+        Args:
+            content: The full content of data_pack_market.md
+            
+        Returns:
+            List of validation issues (empty if all checks pass)
+        """
+        issues = []
+        
+        for section, requirements in cls.REQUIRED_STRUCTURE.items():
+            patterns = requirements.get("section_patterns", [section])
+            found_section, section_start = cls._find_section(content, patterns)
+            
+            if section_start == -1:
+                issues.append(f"缺少章节: {section}")
+                continue
+            
+            next_section_match = content.find("\n## ", section_start + 1)
+            if next_section_match == -1:
+                next_section_match = len(content)
+            section_content = content[section_start:next_section_match]
+            
+            if "subsections" in requirements:
+                for subsection_tuple in requirements["subsections"]:
+                    subsection_prefix, subsection_patterns = subsection_tuple
+                    found = False
+                    for pattern in subsection_patterns:
+                        if pattern in section_content:
+                            found = True
+                            break
+                    if not found:
+                        issues.append(f"{section} 缺少子章节: {subsection_prefix}")
+                    elif requirements.get("allow_placeholder", False):
+                        placeholder = f"*[§{subsection_prefix.split()[0]} 待Agent WebSearch补充]"
+                        if placeholder in section_content:
+                            issues.append(f"{subsection_prefix} 仍为占位符，待Agent补充")
+            
+            if "required_content" in requirements:
+                for req_content in requirements["required_content"]:
+                    if req_content not in section_content:
+                        issues.append(f"{section} 缺少必要内容: {req_content}")
+        
+        return issues
+    
+    @classmethod
+    def validate_file(cls, filepath: str) -> list:
+        """Validate a data_pack_market.md file.
+        
+        Args:
+            filepath: Path to the data_pack_market.md file
+            
+        Returns:
+            List of validation issues (empty if all checks pass)
+        """
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                content = f.read()
+            return cls.validate(content)
+        except FileNotFoundError:
+            return [f"文件不存在: {filepath}"]
+        except Exception as e:
+            return [f"读取文件失败: {e}"]
+
+
+class WarningThresholds:
+    """可配置的警告阈值参数"""
+    
+    YOY_CHANGE_THRESHOLD = 3.0
+    YOY_MAX_YEARS = 5
+    GOODWILL_RATIO_THRESHOLD = 0.20
+    DEBT_RATIO_THRESHOLD = 0.70
+    
+    @classmethod
+    def set_thresholds(cls, yoy_change: float = None, yoy_max_years: int = None,
+                       goodwill_ratio: float = None, debt_ratio: float = None):
+        """动态设置阈值参数"""
+        if yoy_change is not None:
+            cls.YOY_CHANGE_THRESHOLD = yoy_change
+        if yoy_max_years is not None:
+            cls.YOY_MAX_YEARS = yoy_max_years
+        if goodwill_ratio is not None:
+            cls.GOODWILL_RATIO_THRESHOLD = goodwill_ratio
+        if debt_ratio is not None:
+            cls.DEBT_RATIO_THRESHOLD = debt_ratio
 
 
 class WarningsCollector:
@@ -3485,10 +3925,19 @@ class WarningsCollector:
 
     def __init__(self):
         self.warnings = []
+        self.check_results = []
 
     def check_missing_data(self, section_name: str, df: pd.DataFrame):
         """Warn if a data section returned empty."""
-        if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        is_empty = df is None or (isinstance(df, pd.DataFrame) and df.empty)
+        self.check_results.append({
+            "check": "数据完整性",
+            "item": section_name,
+            "threshold": "非空",
+            "actual": "空" if is_empty else "非空",
+            "passed": not is_empty,
+        })
+        if is_empty:
             self.warnings.append({
                 "type": "DATA_MISSING",
                 "severity": "中",
@@ -3496,30 +3945,63 @@ class WarningsCollector:
             })
 
     def check_yoy_change(self, section_name: str, field_name: str,
-                         values: list, threshold: float = 3.0,
-                         dates: list = None):
-        """Warn if year-over-year change exceeds threshold (e.g., 300%)."""
-        for i in range(len(values) - 1):
+                         values: list, threshold: float = None,
+                         dates: list = None, max_years: int = None):
+        """Warn if year-over-year change exceeds threshold.
+        
+        Args:
+            max_years: Only check the most recent N years.
+                       Set to 0 or negative to check all years.
+        """
+        if threshold is None:
+            threshold = WarningThresholds.YOY_CHANGE_THRESHOLD
+        if max_years is None:
+            max_years = WarningThresholds.YOY_MAX_YEARS
+            
+        limit = len(values) - 1 if max_years <= 0 else min(len(values) - 1, max_years)
+        for i in range(limit):
             curr, prev = values[i], values[i + 1]
+            curr_date = dates[i] if dates and i < len(dates) else ""
+            prev_date = dates[i + 1] if dates and i + 1 < len(dates) else ""
+            
             if prev is not None and curr is not None and float(prev) != 0:
                 try:
                     change = abs(float(curr) / float(prev) - 1)
+                    period = f"{prev_date}→{curr_date}" if curr_date and prev_date else ""
+                    
+                    self.check_results.append({
+                        "check": "同比变化",
+                        "item": f"{section_name}/{field_name}",
+                        "threshold": f"≤{threshold*100:.0f}%",
+                        "actual": f"{change*100:.1f}%",
+                        "period": period,
+                        "curr_value": curr,
+                        "prev_value": prev,
+                        "curr_year": curr_date,
+                        "prev_year": prev_date,
+                        "passed": change <= threshold,
+                    })
                     if change > threshold:
-                        period = ""
-                        if dates and i + 1 < len(dates):
-                            period = f"{dates[i+1]}→{dates[i]} "
                         self.warnings.append({
                             "type": "YOY_ANOMALY",
                             "severity": "高",
                             "message": f"{section_name}/{field_name}: "
-                                       f"{period}同比变化 {change*100:.0f}% 超过 {threshold*100:.0f}% 阈值",
+                                       f"{period} 同比变化 {change*100:.0f}% 超过 {threshold*100:.0f}% 阈值",
                         })
                 except (ValueError, ZeroDivisionError):
                     pass
 
     def check_audit_risk(self, audit_opinion: str):
         """Warn if audit opinion is not clean."""
-        if audit_opinion and audit_opinion not in ("标准无保留意见", "—", ""):
+        is_clean = audit_opinion in ("标准无保留意见", "—", "", None)
+        self.check_results.append({
+            "check": "审计意见",
+            "item": "年报审计",
+            "threshold": "标准无保留意见",
+            "actual": audit_opinion if audit_opinion else "未知",
+            "passed": is_clean,
+        })
+        if not is_clean:
             self.warnings.append({
                 "type": "AUDIT_RISK",
                 "severity": "高",
@@ -3527,25 +4009,41 @@ class WarningsCollector:
             })
 
     def check_goodwill_ratio(self, goodwill: float, total_assets: float):
-        """Warn if goodwill/total_assets > 20%."""
+        """Warn if goodwill/total_assets exceeds threshold."""
+        threshold = WarningThresholds.GOODWILL_RATIO_THRESHOLD
         if goodwill and total_assets and total_assets > 0:
             ratio = float(goodwill) / float(total_assets)
-            if ratio > 0.20:
+            self.check_results.append({
+                "check": "商誉占比",
+                "item": "商誉/总资产",
+                "threshold": f"≤{threshold*100:.0f}%",
+                "actual": f"{ratio*100:.2f}%",
+                "passed": ratio <= threshold,
+            })
+            if ratio > threshold:
                 self.warnings.append({
                     "type": "GOODWILL_RISK",
                     "severity": "高",
-                    "message": f"商誉占总资产比例 {ratio*100:.1f}% 超过 20%",
+                    "message": f"商誉占总资产比例 {ratio*100:.1f}% 超过 {threshold*100:.0f}%",
                 })
 
     def check_debt_ratio(self, total_liab: float, total_assets: float):
-        """Warn if debt ratio > 70%."""
+        """Warn if debt ratio exceeds threshold."""
+        threshold = WarningThresholds.DEBT_RATIO_THRESHOLD
         if total_liab and total_assets and total_assets > 0:
             ratio = float(total_liab) / float(total_assets)
-            if ratio > 0.70:
+            self.check_results.append({
+                "check": "资产负债率",
+                "item": "负债/总资产",
+                "threshold": f"≤{threshold*100:.0f}%",
+                "actual": f"{ratio*100:.2f}%",
+                "passed": ratio <= threshold,
+            })
+            if ratio > threshold:
                 self.warnings.append({
                     "type": "LEVERAGE_RISK",
                     "severity": "中",
-                    "message": f"资产负债率 {ratio*100:.1f}% 超过 70%",
+                    "message": f"资产负债率 {ratio*100:.1f}% 超过 {threshold*100:.0f}%",
                 })
 
     def format_warnings(self) -> str:
@@ -3556,7 +4054,6 @@ class WarningsCollector:
             lines.append("未检测到异常。")
             return "\n".join(lines)
 
-        # Group by severity
         high = [w for w in self.warnings if w["severity"] == "高"]
         medium = [w for w in self.warnings if w["severity"] == "中"]
         low = [w for w in self.warnings if w["severity"] == "低"]
@@ -3590,11 +4087,11 @@ Examples:
   %(prog)s --code 600887.SH
   %(prog)s --code 600887 --output output/data_pack_market.md
   %(prog)s --code 00700.HK --extra-fields balancesheet.defer_tax_assets
+  %(prog)s --validate output/data_pack_market.md
         """,
     )
     parser.add_argument(
         "--code",
-        required=True,
         help="Stock code (e.g., 600887.SH, 000858.SZ, 00700.HK, or plain digits)",
     )
     parser.add_argument(
@@ -3617,13 +4114,33 @@ Examples:
         action="store_true",
         help="Print parsed arguments and exit without calling API",
     )
+    parser.add_argument(
+        "--validate",
+        metavar="FILE",
+        help="Validate an existing data_pack_market.md file for structure completeness",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    # Validate and normalize stock code
+    if args.validate:
+        print(f"Validating {args.validate}...")
+        issues = DataPackValidator.validate_file(args.validate)
+        if issues:
+            print(f"发现 {len(issues)} 个问题:")
+            for issue in issues:
+                print(f"  - {issue}")
+            sys.exit(1)
+        else:
+            print("校验通过，所有必填章节和内容完整。")
+            return
+
+    if not args.code:
+        print("Error: --code is required when not using --validate", file=sys.stderr)
+        sys.exit(1)
+
     try:
         ts_code = validate_stock_code(args.code)
     except ValueError as e:
@@ -3638,14 +4155,12 @@ def main():
         print(f"  Extra fields: {args.extra_fields or 'none'}")
         return
 
-    # Get token
     token = args.token or get_token()
     client = TushareClient(token)
 
     print(f"Collecting data for {ts_code}...")
     data_pack = client.assemble_data_pack(ts_code)
 
-    # Handle extra fields
     if args.extra_fields:
         extra_lines = ["\n", format_header(2, "附加字段"), ""]
         for field_spec in args.extra_fields:
@@ -3666,7 +4181,6 @@ def main():
                 extra_lines.append(f"- {endpoint}.{field_name}: 获取失败 ({e})")
         data_pack += "\n".join(extra_lines)
 
-    # Write output
     import os
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:

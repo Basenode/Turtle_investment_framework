@@ -34,6 +34,56 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 from config import get_token, get_api_url, validate_stock_code, check_local_pdf
 import tushare as ts
 
+REPORT_PERIODS = {
+    "年报": "年报",
+    "半年报": "半年报", 
+    "一季报": "一季报",
+    "一季度报": "一季报",
+    "三季度报": "三季度报",
+    "季报": "季报",
+}
+
+PERIOD_ORDER = ["年报", "半年报", "一季报", "三季度报"]
+
+def parse_report_period(period_str: str) -> str:
+    """Normalize report period string.
+    
+    Args:
+        period_str: Raw period string (e.g., '年报', '一季度报', '一季报')
+    
+    Returns:
+        Normalized period name (e.g., '年报', '一季报')
+    """
+    period_str = period_str.strip()
+    for key, value in REPORT_PERIODS.items():
+        if key in period_str:
+            return value
+    return "年报"
+
+def infer_report_period_from_filename(filename: str) -> tuple[int, str]:
+    """Extract year and period from PDF filename.
+    
+    Args:
+        filename: PDF filename (e.g., '云天化2025年年度报告.pdf')
+    
+    Returns:
+        (year, period) tuple, e.g., (2025, '年报')
+    """
+    year_match = re.search(r'20\d{2}', filename)
+    year = int(year_match.group()) if year_match else datetime.now().year - 1
+    
+    if "年度报告" in filename or "年报" in filename:
+        period = "年报"
+    elif "半年度" in filename or "半年报" in filename:
+        period = "半年报"
+    elif "第一季度" in filename or "一季报" in filename or "一季度" in filename:
+        period = "一季报"
+    elif "第三季度" in filename or "三季度" in filename or "三季度报" in filename:
+        period = "三季度报"
+    else:
+        period = "年报"
+    
+    return year, period
 
 def get_company_name(ts_code: str) -> str:
     """Fetch company name from Tushare stock_basic API.
@@ -46,7 +96,12 @@ def get_company_name(ts_code: str) -> str:
     """
     try:
         token = get_token()
-        pro = ts.pro_api(token)
+        api_url = get_api_url()
+        ts.set_token(token)
+        pro = ts.pro_api(timeout=30)
+        if api_url:
+            pro._DataApi__token = token
+            pro._DataApi__http_url = api_url
         
         if ts_code.endswith('.HK'):
             df = pro.hk_basic(ts_code=ts_code, fields='ts_code,name')
@@ -61,37 +116,53 @@ def get_company_name(ts_code: str) -> str:
     return ""
 
 
-def copy_local_pdf(local_path: str, output_dir: Path, ts_code: str, year: int = None) -> tuple[bool, str]:
+def copy_local_pdf(local_path: str, output_dir: Path, ts_code: str, 
+                   company_name: str = None, year: int = None, 
+                   period: str = "年报") -> tuple[bool, str, int, str]:
     """Copy local PDF file to output directory with standardized naming.
+    
+    Naming convention: {代码}_{年份}_{公司名}_{报告期}.pdf
+    Example: 600989_2024_宝丰能源_年报.pdf
     
     Args:
         local_path: Path to local PDF file
         output_dir: Output directory to copy to
         ts_code: Stock code for naming
-        year: Year for naming (default: latest available)
+        company_name: Company name (optional)
+        year: Year for naming (default: inferred from filename)
+        period: Report period (default: inferred from filename)
     
     Returns:
-        (success, new_path or error_message)
+        (success, new_path or error_message, year, period)
     """
-    if year is None:
-        year = datetime.now().year - 1
-        if datetime.now().month < 4:
-            year -= 1
+    filename = os.path.basename(local_path)
+    
+    if year is None or period == "年报":
+        inferred_year, inferred_period = infer_report_period_from_filename(filename)
+        if year is None:
+            year = inferred_year
+        if period == "年报":
+            period = inferred_period
     
     code = ts_code.split('.')[0]
     
     if not os.path.exists(local_path):
-        return False, f"本地 PDF 文件不存在: {local_path}"
+        return False, f"本地 PDF 文件不存在: {local_path}", year, period
     
-    filename = f"{code}_{year}_年报.pdf"
-    dest_path = output_dir / filename
+    if company_name:
+        pdf_filename = f"{code}_{year}_{company_name}_{period}.pdf"
+    else:
+        pdf_filename = f"{code}_{year}_{period}.pdf"
+    
+    dest_path = output_dir / pdf_filename
     
     try:
         shutil.copy2(local_path, str(dest_path))
         filesize = os.path.getsize(dest_path)
-        return True, str(dest_path)
+        print(f"  PDF 已保存: {pdf_filename} ({filesize:,} bytes)")
+        return True, str(dest_path), year, period
     except Exception as e:
-        return False, f"复制 PDF 文件失败: {e}"
+        return False, f"复制 PDF 文件失败: {e}", year, period
 
 
 def search_report_url(stock_code: str, year: int = None) -> dict:
@@ -324,9 +395,8 @@ def run_phase0(ts_code: str, output_dir: Path, year: int = None) -> tuple[bool, 
         return False, "PDF 下载失败"
 
 
-def run_phase1a(ts_code: str, output_dir: Path) -> tuple[bool, str]:
+def run_phase1a(ts_code: str, output_file: Path) -> tuple[bool, str]:
     """Run Tushare data collection (Phase 1A)."""
-    output_file = output_dir / "data_pack_market.md"
     
     cmd = [
         sys.executable,
@@ -380,73 +450,104 @@ def run_phase2a(pdf_path: str, output_dir: Path) -> tuple[bool, str]:
         return False, str(e)
 
 
-def find_existing_output_dir(ts_code: str, company_name: str = None) -> Path:
-    """Find existing output directory for the given stock.
+def find_existing_output_dir(ts_code: str, company_name: str = None, 
+                             year: int = None, period: str = None) -> Path:
+    """Find existing output directory for the given stock and report period.
     
-    Checks multiple naming conventions to enable data reuse:
-    1. {代码}_{公司} (current standard): output/600989SH_宝丰能源
-    2. {公司}_{代码} (legacy format): output/宝丰能源_600989SH
-    3. {代码} (minimal format): output/600989SH
+    New directory structure:
+    output/{代码}_{公司}/{年份}_{报告期}/
+    Example: output/600989SH_宝丰能源/2024_年报/
     
-    Returns the first existing directory, or None if not found.
+    Legacy directory structure (backward compatible):
+    output/{代码}_{公司}/
+    
+    Returns the first existing directory matching the criteria, or None if not found.
     """
     code = ts_code.replace(".", "")
     output_root = PROJECT_ROOT / "output"
     
-    candidates = []
-    if company_name:
-        candidates.append(f"{code}_{company_name}")
-        candidates.append(f"{company_name}_{code}")
-    candidates.append(code)
-    candidates.append(ts_code.replace(".", "_"))
+    company_dir_name = f"{code}_{company_name}" if company_name else code
     
-    for dir_name in candidates:
-        candidate_path = output_root / dir_name
-        if candidate_path.exists() and candidate_path.is_dir():
-            return candidate_path
+    if year and period:
+        period_dir = output_root / company_dir_name / f"{year}_{period}"
+        if period_dir.exists() and period_dir.is_dir():
+            return period_dir
+    
+    company_dir = output_root / company_dir_name
+    if company_dir.exists() and company_dir.is_dir():
+        return None
+    
+    legacy_candidates = []
+    if company_name:
+        legacy_candidates.append(f"{company_name}_{code}")
+    legacy_candidates.append(code)
+    legacy_candidates.append(ts_code.replace(".", "_"))
+    
+    for dir_name in legacy_candidates:
+        legacy_dir = output_root / dir_name
+        if legacy_dir.exists() and legacy_dir.is_dir():
+            return None
     
     return None
 
 
-def create_output_dir(ts_code: str, company_name: str = None, reuse_existing: bool = True) -> Path:
+def create_output_dir(ts_code: str, company_name: str = None, 
+                      year: int = None, period: str = "年报",
+                      reuse_existing: bool = True) -> Path:
     """Create output directory for analysis results.
     
-    Follows coordinator.md convention:
-    {output_dir} = {workspace}/output/{代码}_{公司}
-    Example: output/600989SH_宝丰能源
+    New directory structure:
+    output/{代码}_{公司}/{年份}_{报告期}/
+    Example: output/600989SH_宝丰能源/2024_年报/
     
-    If reuse_existing=True, first checks for existing directories with different
-    naming conventions to enable data reuse across sessions.
+    This structure enables:
+    1. Organized storage of multiple report periods per company
+    2. Data reuse within the same report period
+    3. Clear separation of different report periods
+    
+    Args:
+        ts_code: Stock code (e.g., '600989.SH')
+        company_name: Company name (e.g., '宝丰能源')
+        year: Report year (e.g., 2024)
+        period: Report period (e.g., '年报', '一季报')
+        reuse_existing: Whether to reuse existing directory for same period
     """
     code = ts_code.replace(".", "")
+    output_root = PROJECT_ROOT / "output"
+    
+    company_dir_name = f"{code}_{company_name}" if company_name else code
+    company_dir = output_root / company_dir_name
     
     if reuse_existing:
-        existing_dir = find_existing_output_dir(ts_code, company_name)
+        existing_dir = find_existing_output_dir(ts_code, company_name, year, period)
         if existing_dir:
             print(f"  [INFO] 复用已有目录: {existing_dir}")
             return existing_dir
     
-    if company_name:
-        dir_name = f"{code}_{company_name}"
+    if year and period:
+        period_dir_name = f"{year}_{period}"
+        period_dir = company_dir / period_dir_name
+        period_dir.mkdir(parents=True, exist_ok=True)
+        return period_dir
     else:
-        dir_name = ts_code.replace(".", "_")
-    
-    output_dir = PROJECT_ROOT / "output" / dir_name
-    output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir
+        company_dir.mkdir(parents=True, exist_ok=True)
+        return company_dir
 
 
 def generate_agent_tasks(ts_code: str, output_dir: Path,
                          has_pdf: bool, pdf_path: str = None, company_name: str = None,
-                         channel: str = "direct") -> dict:
+                         channel: str = "direct", year: int = None, period: str = "年报") -> dict:
     """Generate structured Agent task definitions.
     
     Returns a dict with task definitions that can be:
     1. Written to a JSON file for programmatic consumption
     2. Formatted as markdown instructions for LLM consumption
     
-    Report output follows coordinator.md convention:
-    {output_dir}/{公司名}_{代码}_分析报告.md
+    File naming convention:
+    - PDF: {代码}_{年份}_{公司名}_{报告期}.pdf
+    - Market data: data_pack_market.md (fixed name)
+    - Report data: data_pack_report.md (fixed name)
+    - Analysis report: {公司名}_{代码}_分析报告.md
     """
     date_str = datetime.now().strftime("%Y-%m-%d")
     code = ts_code.replace(".", "")
@@ -455,7 +556,12 @@ def generate_agent_tasks(ts_code: str, output_dir: Path,
     
     prompts_dir = PROJECT_ROOT / "prompts"
     
-    report_filename = f"{company_name}_{code}_分析报告.md"
+    market_data_filename = "data_pack_market.md"
+    report_data_filename = "data_pack_report.md"
+    report_filename = f"{company_name}_{code}_分析报告.md" if company_name else f"{code}_分析报告.md"
+    
+    market_data_path = output_dir / market_data_filename
+    report_data_path = output_dir / report_data_filename
     report_path = output_dir / report_filename
     
     tasks = {
@@ -464,8 +570,12 @@ def generate_agent_tasks(ts_code: str, output_dir: Path,
             "company_name": company_name,
             "channel": channel,
             "date": date_str,
+            "year": year,
+            "period": period,
             "has_pdf": has_pdf,
             "output_dir": str(output_dir),
+            "market_data_path": str(market_data_path),
+            "report_data_path": str(report_data_path),
             "report_path": str(report_path),
             "prompts_dir": str(prompts_dir),
         },
@@ -476,7 +586,7 @@ def generate_agent_tasks(ts_code: str, output_dir: Path,
     tasks["completed_phases"].append({
         "phase": "1A",
         "name": "Tushare 数据采集",
-        "output": str(output_dir / "data_pack_market.md"),
+        "output": str(market_data_path),
     })
     
     if has_pdf:
@@ -491,24 +601,25 @@ def generate_agent_tasks(ts_code: str, output_dir: Path,
         "name": "WebSearch 数据补充",
         "description": "通过 WebSearch 补充 §7/§8/§10/§13 数据",
         "prompt_file": str(prompts_dir / "phase1_数据采集.md"),
-        "inputs": [str(output_dir / "data_pack_market.md")],
-        "outputs": [str(output_dir / "data_pack_market.md")],
+        "inputs": [str(market_data_path)],
+        "outputs": [str(market_data_path)],
         "dependencies": ["1A"],
         "instructions": f"""
 请阅读 {prompts_dir / 'phase1_数据采集.md'} 中的完整指令。
 
 目标股票：{ts_code}（{company_name}）
 持股渠道：{channel}
+报告期：{year}年{period}
 
-data_pack_market.md 已由 tushare_collector.py 生成了 §1-§6, §7(部分:十大股东), §9, §11, §12, §14, §15, §16, §3P, §4P, 审计意见, §13.1 部分。
+{market_data_filename} 已由 tushare_collector.py 生成了 §1-§6, §7(部分:十大股东), §9, §11, §12, §14, §15, §16, §3P, §4P, 审计意见, §13.1 部分。
 
-你的任务是通过 WebSearch 补充以下章节，替换 data_pack_market.md 中的占位符：
+你的任务是通过 WebSearch 补充以下章节，替换文件中的占位符：
 - §7 管理层与治理（追加定性信息）
 - §8 行业与竞争（替换占位符）
 - §10 MD&A 摘要（替换占位符）
 - §13.2 Warnings（替换占位符）
 
-注意：data_pack_market.md 中 §8, §10, §13.2 含占位符 `*[§N 待Agent WebSearch补充]*`。
+注意：文件中 §8, §10, §13.2 含占位符 `*[§N 待Agent WebSearch补充]*`。
 使用 Edit 工具**替换**这些占位符为实际内容。
 """,
     })
@@ -520,15 +631,16 @@ data_pack_market.md 已由 tushare_collector.py 生成了 §1-§6, §7(部分:�
             "description": "从 PDF 提取附注数据",
             "prompt_file": str(prompts_dir / "phase2_PDF解析.md"),
             "inputs": [str(output_dir / "pdf_sections.json")],
-            "outputs": [str(output_dir / "data_pack_report.md")],
+            "outputs": [str(report_data_path)],
             "dependencies": ["2A"],
             "instructions": f"""
 请阅读 {prompts_dir / 'phase2_PDF解析.md'} 中的完整指令。
 
 pdf_sections.json 文件路径：{output_dir / 'pdf_sections.json'}
 公司名称：{company_name}
+报告期：{year}年{period}
 
-从 pdf_sections.json 提取以下数据，写入 {output_dir / 'data_pack_report.md'}：
+从 pdf_sections.json 提取以下数据，写入 {report_data_path}：
 - P2 受限资产
 - P3 应收账款账龄
 - P4 关联方交易
@@ -551,8 +663,8 @@ pdf_sections.json 文件路径：{output_dir / 'pdf_sections.json'}
             str(prompts_dir / "references" / "factor4_估值与安全边际.md"),
         ],
         "inputs": [
-            str(output_dir / "data_pack_market.md"),
-            str(output_dir / "data_pack_report.md") if has_pdf else None,
+            str(market_data_path),
+            str(report_data_path) if has_pdf else None,
         ],
         "outputs": [str(report_path)],
         "dependencies": ["1B"] + (["2B"] if has_pdf else []),
@@ -560,8 +672,8 @@ pdf_sections.json 文件路径：{output_dir / 'pdf_sections.json'}
 请阅读 {prompts_dir / 'phase3_分析与报告.md'} 中的完整指令。
 
 数据包文件：
-  - {output_dir / 'data_pack_market.md'}
-  - {output_dir / 'data_pack_report.md' if has_pdf else '（无PDF，使用降级方案）'}
+  - {market_data_path}
+  - {report_data_path if has_pdf else '（无PDF，使用降级方案）'}
 
 因子参考文件：
   - {prompts_dir / 'references' / 'factor1_资产质量与商业模式.md'}
@@ -590,6 +702,10 @@ pdf_sections.json 文件路径：{output_dir / 'pdf_sections.json'}
 def format_tasks_as_markdown(tasks: dict) -> str:
     """Format Agent tasks as readable markdown instructions."""
     meta = tasks["meta"]
+    year = meta.get('year', '')
+    period = meta.get('period', '')
+    period_str = f"{year}年{period}" if year and period else ""
+    
     lines = [
         "=" * 60,
         "后续步骤（需要 Agent 执行）",
@@ -598,12 +714,18 @@ def format_tasks_as_markdown(tasks: dict) -> str:
         f"股票代码: {meta['ts_code']}",
         f"公司名称: {meta['company_name']}",
         f"持股渠道: {meta['channel']}",
+    ]
+    
+    if period_str:
+        lines.append(f"报告期: {period_str}")
+    
+    lines.extend([
         f"输出目录: {meta['output_dir']}",
         "",
         "-" * 60,
         "已完成阶段",
         "-" * 60,
-    ]
+    ])
     
     for phase in tasks["completed_phases"]:
         lines.append(f"  ✅ Phase {phase['phase']}: {phase['name']}")
@@ -685,7 +807,13 @@ Examples:
         "--year",
         type=int,
         default=None,
-        help="Target year for PDF download (default: latest available)"
+        help="Target year for report (default: inferred from PDF filename or latest available)"
+    )
+    parser.add_argument(
+        "--period",
+        choices=["年报", "半年报", "一季报", "三季度报"],
+        default="年报",
+        help="Report period type (default: 年报)"
     )
     parser.add_argument(
         "--channel",
@@ -719,13 +847,32 @@ Examples:
         else:
             print("  [WARN] 未能获取公司名称，将使用代码作为目录名")
     
-    output_dir = create_output_dir(ts_code, company_name)
+    report_year = args.year
+    report_period = args.period
+    
+    if args.pdf and (report_year is None or report_period == "年报"):
+        inferred_year, inferred_period = infer_report_period_from_filename(args.pdf)
+        if report_year is None:
+            report_year = inferred_year
+        if report_period == "年报" and inferred_period != "年报":
+            report_period = inferred_period
+    
+    if report_year is None:
+        report_year = datetime.now().year - 1
+        if datetime.now().month < 4:
+            report_year -= 1
+    
+    print(f"   报告期: {report_year}年{report_period}")
+    
+    output_dir = create_output_dir(ts_code, company_name, report_year, report_period)
     
     print(f"   输出目录: {output_dir}")
     
     results = {
         "ts_code": ts_code,
         "channel": args.channel,
+        "year": report_year,
+        "period": report_period,
         "output_dir": str(output_dir),
         "phases": {}
     }
@@ -740,14 +887,20 @@ Examples:
         print(f"{'='*60}")
         print(f"本地文件: {args.pdf}")
         
-        success, msg = copy_local_pdf(args.pdf, output_dir, ts_code, args.year)
+        success, msg, actual_year, actual_period = copy_local_pdf(
+            args.pdf, output_dir, ts_code, company_name, report_year, report_period
+        )
         results["phases"]["phase0"] = {"success": success, "output": msg, "source": "local"}
         
         if success:
             pdf_path = msg
             has_pdf = True
-            print(f"  复制成功: {pdf_path}")
-            print(f"  文件大小: {os.path.getsize(pdf_path):,} bytes")
+            if actual_year != report_year:
+                report_year = actual_year
+                results["year"] = report_year
+            if actual_period != report_period:
+                report_period = actual_period
+                results["period"] = report_period
         else:
             print(f"\n⚠️ 本地 PDF 处理失败: {msg}")
             if args.download_pdf:
@@ -766,9 +919,13 @@ Examples:
             print(f"\n⚠️ Phase 0 失败: {msg}")
             print("  将继续执行无 PDF 模式...")
     
+    code = ts_code.replace(".", "")
+    market_data_filename = "data_pack_market.md"
+    market_data_path = output_dir / market_data_filename
+    
     # Phase 1A: Tushare data collection
     if not args.skip_phase1a:
-        success, msg = run_phase1a(ts_code, output_dir)
+        success, msg = run_phase1a(ts_code, market_data_path)
         results["phases"]["phase1a"] = {"success": success, "output": msg}
         if not success:
             print(f"\n❌ Phase 1A 失败: {msg}")
@@ -787,7 +944,8 @@ Examples:
     # Generate structured Agent tasks
     tasks = generate_agent_tasks(
         ts_code, output_dir, has_pdf, pdf_path,
-        company_name=company_name, channel=args.channel
+        company_name=company_name, channel=args.channel,
+        year=report_year, period=report_period
     )
     
     # Write tasks to JSON file for programmatic consumption
