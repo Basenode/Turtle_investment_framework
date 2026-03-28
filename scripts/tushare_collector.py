@@ -519,12 +519,31 @@ class TushareClient:
         if not daily.empty:
             self._store["basic_info"] = daily
             d = daily.iloc[0]
+            close = self._safe_float(d.get("close")) or 0
+            total_mv_wan = self._safe_float(d.get("total_mv")) or 0
+            total_share_wan = self._safe_float(d.get("total_share")) or 0
+            float_share_wan = self._safe_float(d.get("float_share")) or 0
+
+            implied_total_share_yi = None
+            diff_pct = None
+            if close > 0 and total_mv_wan > 0:
+                implied_total_share = total_mv_wan * 10000 / close
+                implied_total_share_yi = implied_total_share / 1e8
+                if total_share_wan > 0:
+                    total_share_yi = total_share_wan / 10000
+                    diff_pct = (implied_total_share_yi - total_share_yi) / total_share_yi * 100
             val_rows = [
                 ["当前价格", f"{d.get('close', '—')}"],
                 ["PE (TTM)", f"{d.get('pe_ttm', '—')}"],
                 ["PB", f"{d.get('pb', '—')}"],
                 ["总市值 (万元)", format_number(d.get('total_mv', None), divider=1, decimals=2)],
                 ["流通市值 (万元)", format_number(d.get('circ_mv', None), divider=1, decimals=2)],
+                ["总股本 (万股)", format_number(total_share_wan, divider=1, decimals=2) if total_share_wan > 0 else "—"],
+                ["总股本 (亿股)", f"{total_share_wan / 10000:.2f}" if total_share_wan > 0 else "—"],
+                ["流通股本 (万股)", format_number(float_share_wan, divider=1, decimals=2) if float_share_wan > 0 else "—"],
+                ["流通股本 (亿股)", f"{float_share_wan / 10000:.2f}" if float_share_wan > 0 else "—"],
+                ["股本校验：市值/股价反推(亿股)", f"{implied_total_share_yi:.2f}" if implied_total_share_yi is not None else "—"],
+                ["股本校验：差异(%)", f"{diff_pct:.2f}%" if diff_pct is not None else "—"],
             ]
 
         lines = [format_header(2, "1. 基本信息"), ""]
@@ -1208,7 +1227,8 @@ class TushareClient:
             return "\n".join(lines)
 
         df_impl = df[df["div_proc"] == "实施"].copy()
-        df_plan = df[df["div_proc"].isin(["董事会预案", "股东大会预案"])].copy()
+        proc_str = df["div_proc"].astype(str)
+        df_plan = df[(proc_str.str.contains("预案") | proc_str.str.contains("通过")) & (proc_str != "实施")].copy()
         
         income_df = self._get_annual_df("income")
         np_lookup = {}
@@ -1290,14 +1310,37 @@ class TushareClient:
             df_plan["end_date_str"] = df_plan["end_date"].astype(str)
             df_plan["fiscal_year"] = df_plan["end_date_str"].str[:4]
             df_plan["is_interim"] = df_plan["end_date_str"].str[4:6] == "06"
+            df_plan = df_plan[pd.to_numeric(df_plan["cash_div_tax"], errors="coerce").fillna(0) > 0].copy()
+            if not df_impl.empty:
+                impl_pairs = set(zip(df_impl["end_date"].astype(str), df_impl["cash_div_tax"].astype(float)))
+                df_plan = df_plan[~df_plan.apply(
+                    lambda r: (str(r.get("end_date", "")), float(r.get("cash_div_tax") or 0)) in impl_pairs,
+                    axis=1
+                )].copy()
+            df_plan = df_plan.sort_values(["end_date", "ann_date"], ascending=False)
+            df_plan = df_plan.drop_duplicates(subset=["end_date", "cash_div_tax"], keep="first")
             
             plan_headers = ["会计年度", "类型", "每股现金分红(税前)", "预案公告日", "总分红(百万元)", "分红率", "状态"]
             plan_rows = []
-            for _, r in df_plan.sort_values("end_date", ascending=False).head(3).iterrows():
+            basic_df = self._store.get("basic_info")
+            fallback_total_share_wan = None
+            if basic_df is not None and not basic_df.empty:
+                fallback_total_share_wan = self._safe_float(basic_df.iloc[0].get("total_share"))
+
+            latest_fy_for_plan = max(np_lookup.keys()) if np_lookup else None
+            plan_display_df = df_plan
+            if latest_fy_for_plan is not None and "fiscal_year" in df_plan.columns:
+                tmp = df_plan[df_plan["fiscal_year"] == latest_fy_for_plan]
+                if not tmp.empty:
+                    plan_display_df = tmp
+
+            for _, r in plan_display_df.sort_values("end_date", ascending=False).head(3).iterrows():
                 fy = str(r.get("end_date", ""))[:4]
                 div_type = "中期" if str(r.get("end_date", ""))[4:6] == "06" else "年度"
                 cash_div = r.get("cash_div_tax", 0) or 0
-                base_share = r.get("base_share", 0) or 0
+                base_share = self._safe_float(r.get("base_share")) or 0
+                if fallback_total_share_wan and (base_share <= 0 or base_share < fallback_total_share_wan * 0.5 or base_share > fallback_total_share_wan * 1.2):
+                    base_share = fallback_total_share_wan
                 total_div = cash_div * base_share * 10000 / 1000000
                 np_val = np_lookup.get(fy, 0)
                 payout = (total_div / np_val * 100) if np_val > 0 else 0
@@ -1382,8 +1425,13 @@ class TushareClient:
         lines.append("")
         
         if not df_plan.empty:
-            plan_dps = df_plan["cash_div_tax"].sum()
-            plan_yield = (plan_dps / latest_price * 100) if latest_price > 0 else 0
+            latest_fy = max(np_lookup.keys()) if np_lookup else None
+            plan_scope = df_plan
+            if latest_fy is not None and "fiscal_year" in df_plan.columns:
+                tmp = df_plan[df_plan["fiscal_year"] == latest_fy]
+                if not tmp.empty:
+                    plan_scope = tmp
+            plan_dps = plan_scope["cash_div_tax"].sum()
             total_dps = ttm_dps + plan_dps
             total_yield = (total_dps / latest_price * 100) if latest_price > 0 else 0
             
@@ -1391,8 +1439,30 @@ class TushareClient:
             lines.append("")
             lines.append(f"| 指标 | 数值 | 口径说明 |")
             lines.append(f"| --- | ---: | --- |")
-            lines.append(f"| 预案每股分红 | {plan_dps:.4f}元 | 待实施分红预案合计 |")
+            lines.append(f"| TTM每股分红 | {ttm_dps:.4f}元 | 过去12个月已实施分红合计 |")
+            lines.append(f"| 预案每股分红 | {plan_dps:.4f}元 | 待实施分红预案（默认仅取最新会计年度） |")
+            lines.append(f"| 预期总每股分红 | {total_dps:.4f}元 | TTM分红 + 预案分红 |")
             lines.append(f"| 预期股息率 | {total_yield:.2f}% | (TTM分红+预案分红)/当前股价 |")
+            basic_df = self._store.get("basic_info")
+            fallback_total_share_wan = None
+            if basic_df is not None and not basic_df.empty:
+                fallback_total_share_wan = self._safe_float(basic_df.iloc[0].get("total_share"))
+            if latest_fy is not None and not df_impl.empty:
+                fy_impl = df_impl[df_impl["fiscal_year"] == latest_fy]
+                fy_plan = plan_scope if "fiscal_year" in plan_scope.columns else df_plan
+                fy_dps = (fy_impl["cash_div_tax"].sum() if not fy_impl.empty else 0) + \
+                    (fy_plan["cash_div_tax"].sum() if not fy_plan.empty else 0)
+                fy_total_div = 0.0
+                for _, r in pd.concat([fy_impl, fy_plan], ignore_index=True).iterrows():
+                    cash_div = self._safe_float(r.get("cash_div_tax")) or 0
+                    base_share = self._safe_float(r.get("base_share")) or 0
+                    if fallback_total_share_wan and (base_share <= 0 or base_share < fallback_total_share_wan * 0.5 or base_share > fallback_total_share_wan * 1.2):
+                        base_share = fallback_total_share_wan
+                    fy_total_div += cash_div * base_share * 10000 / 1000000
+                np_val = np_lookup.get(latest_fy, 0)
+                fy_payout = (fy_total_div / np_val * 100) if np_val > 0 else None
+                lines.append(f"| {latest_fy}会计年度全年每股分红(含预案) | {fy_dps:.4f}元 | 当年已实施 + 当年预案 |")
+                lines.append(f"| {latest_fy}会计年度全年分红率(含预案) | {fy_payout:.2f}% | (当年已实施+当年预案)/当年归母净利润 |" if fy_payout is not None else f"| {latest_fy}会计年度全年分红率(含预案) | — | (当年已实施+当年预案)/当年归母净利润 |")
             lines.append("")
         
         lines.append("> **口径说明**：")
@@ -1658,9 +1728,39 @@ class TushareClient:
             lines.append("无年报数据\n")
             return "\n".join(lines)
 
+        income_df = self._store.get("income")
+        bs_df = self._store.get("balance_sheet")
+        np_by_end: dict[str, float] = {}
+        eq_by_end: dict[str, float] = {}
+        if income_df is not None and not income_df.empty:
+            for _, r in income_df.iterrows():
+                end = str(r.get("end_date", ""))
+                np_v = self._safe_float(r.get("n_income_attr_p"))
+                if end and np_v is not None:
+                    np_by_end[end] = np_v
+        if bs_df is not None and not bs_df.empty:
+            for _, r in bs_df.iterrows():
+                end = str(r.get("end_date", ""))
+                eq_v = self._safe_float(r.get("total_hldr_eqy_exc_min_int"))
+                if end and eq_v is not None:
+                    eq_by_end[end] = eq_v
+
+        roe_end_list: list[float | None] = []
+        roe_weighted_list: list[float | None] = []
+        for _, r in df.iterrows():
+            end = str(r.get("end_date", ""))
+            roe_end = None
+            if end.endswith("1231"):
+                np_v = np_by_end.get(end)
+                eq_v = eq_by_end.get(end)
+                if np_v is not None and eq_v is not None and eq_v > 0:
+                    roe_end = np_v / eq_v * 100
+            roe_end_list.append(roe_end)
+            roe_weighted_list.append(self._safe_float(r.get("roe_waa")) or self._safe_float(r.get("roe")))
+
         pct_fields = [
-            ("ROE (%)", "roe"),
-            ("加权ROE (%)", "roe_waa"),
+            ("ROE(期末摊薄,%)", roe_end_list),
+            ("ROE(加权法定,%)", roe_weighted_list),
             ("毛利率 (%)", "grossprofit_margin"),
             ("净利率 (%)", "netprofit_margin"),
             ("资产负债率 (%)", "debt_to_assets"),
@@ -1683,9 +1783,13 @@ class TushareClient:
         rows = []
         for label, col in pct_fields:
             row = [label]
-            for _, r in df.iterrows():
-                val = r.get(col)
-                row.append(f"{val:.2f}" if val is not None and val == val else "—")
+            if isinstance(col, list):
+                for v in col:
+                    row.append(f"{v:.2f}" if v is not None else "—")
+            else:
+                for _, r in df.iterrows():
+                    val = r.get(col)
+                    row.append(f"{val:.2f}" if val is not None and val == val else "—")
             rows.append(row)
         for label, col in ratio_fields:
             row = [label]
@@ -1717,8 +1821,8 @@ class TushareClient:
         lines.append(table)
         lines.append("")
         lines.append("> **口径说明**：")
-        lines.append("> - ROE = 净利润 / 期末净资产（简单ROE，非法定披露口径）")
-        lines.append("> - 加权ROE = 加权平均净资产收益率（证监会法定披露口径）")
+        lines.append("> - ROE(期末摊薄) = 归母净利润 / 期末归母权益（用于杜邦拆解，非年报法定口径）")
+        lines.append("> - ROE(加权法定) = 年报披露的加权平均净资产收益率（证监会口径）")
         return "\n".join(lines)
 
     def _get_fina_indicators_hk(self, ts_code: str) -> str:
@@ -2200,9 +2304,10 @@ class TushareClient:
             [
                 ["统计日期", str(latest.get("end_date", "—"))],
                 ["质押笔数", f"{int(latest.get('pledge_count', 0))}"],
-                ["无限售质押 (万股)", format_number(latest.get("unrest_pledge"), divider=1e4, decimals=2)],
-                ["有限售质押 (万股)", format_number(latest.get("rest_pledge"), divider=1e4, decimals=2)],
-                ["总股本 (万股)", format_number(latest.get("total_share"), divider=1e4, decimals=2)],
+                ["无限售质押 (万股)", format_number(latest.get("unrest_pledge"), divider=1, decimals=2)],
+                ["有限售质押 (万股)", format_number(latest.get("rest_pledge"), divider=1, decimals=2)],
+                ["总股本 (万股)", format_number(latest.get("total_share"), divider=1, decimals=2)],
+                ["总股本 (亿股)", f"{(self._safe_float(latest.get('total_share')) or 0) / 10000:.2f}"],
                 ["质押比例 (%)", f"{latest.get('pledge_ratio', 0):.2f}"],
             ],
             alignments=["l", "r"],
@@ -2311,9 +2416,23 @@ class TushareClient:
 
         # A-share path: 使用原始分红数据按会计年度汇总
         div_raw = self._store.get("dividends_raw")
+        div_plan = self._store.get("dividends_plan")
         income_df = self._get_annual_df("income")
         
         if div_raw is not None and not div_raw.empty and not income_df.empty:
+            basic_df = self._store.get("basic_info")
+            fallback_total_share_wan = None
+            if basic_df is not None and not basic_df.empty:
+                fallback_total_share_wan = self._safe_float(basic_df.iloc[0].get("total_share"))
+
+            def _effective_base_share_wan(r, is_plan: bool) -> float:
+                base_share = self._safe_float(r.get("base_share")) or 0
+                if not is_plan:
+                    return base_share
+                if fallback_total_share_wan and (base_share <= 0 or base_share < fallback_total_share_wan * 0.5 or base_share > fallback_total_share_wan * 1.2):
+                    return fallback_total_share_wan
+                return base_share
+
             # Build net income lookup by year
             np_lookup = {}
             for _, r in income_df.iterrows():
@@ -2321,15 +2440,33 @@ class TushareClient:
                 np_lookup[year] = self._safe_float(r.get("n_income_attr_p")) or 0
             
             # 按会计年度汇总所有分红（中期+年度）
-            result = {}
+            impl_div_by_year: dict[str, float] = {}
             for fy in div_raw["fiscal_year"].unique():
                 fy_df = div_raw[div_raw["fiscal_year"] == fy]
-                total_div = 0
+                total_div = 0.0
                 for _, r in fy_df.iterrows():
                     cash_div = self._safe_float(r.get("cash_div_tax")) or 0
-                    base_share = self._safe_float(r.get("base_share")) or 0
-                    total_div += cash_div * base_share * 10000  # base_share is 万股
-                
+                    total_div += cash_div * _effective_base_share_wan(r, is_plan=False) * 10000
+                impl_div_by_year[fy] = total_div
+
+            plan_div_by_year: dict[str, float] = {}
+            if div_plan is not None and not div_plan.empty and "fiscal_year" in div_plan.columns:
+                for fy in div_plan["fiscal_year"].unique():
+                    fy_df = div_plan[div_plan["fiscal_year"] == fy]
+                    total_div = 0.0
+                    for _, r in fy_df.iterrows():
+                        cash_div = self._safe_float(r.get("cash_div_tax")) or 0
+                        total_div += cash_div * _effective_base_share_wan(r, is_plan=True) * 10000
+                    plan_div_by_year[fy] = total_div
+
+            latest_year = max(np_lookup.keys()) if np_lookup else None
+            result: dict[str, float] = {}
+            for fy, impl_total in impl_div_by_year.items():
+                total_div = impl_total
+                if latest_year is not None and fy == latest_year:
+                    plan_total = plan_div_by_year.get(fy, 0.0)
+                    if plan_total > 0:
+                        total_div += plan_total
                 np_val = np_lookup.get(fy, 0)
                 if total_div > 0 and np_val > 0:
                     result[fy] = total_div / np_val * 100
@@ -2743,6 +2880,8 @@ class TushareClient:
         table = format_table(["指标", "合并口径", "母公司口径"], rows,
                              alignments=["l", "r", "r"])
         lines.append(table)
+        lines.append("")
+        lines.append("> 注：现金为报表货币资金（money_cap），未扣受限资金；如 data_pack_report 的 P2 存在受限资产，请在 Phase 3 扣除后再评估短债覆盖与净现金。")
         return "\n".join(lines)
 
     # --- Feature #94: §17.8 EV baseline + "买入就是胜利"基准价 ---
@@ -2953,8 +3092,11 @@ class TushareClient:
         bl_rows = []
         valid_prices = []
         for name, val, logic in baselines:
-            bl_rows.append([name, f"{val:.2f}", logic])
-            valid_prices.append(val)
+            include = val is not None and val == val and val > 0
+            name_show = name if include else f"{name}（不纳入平均）"
+            bl_rows.append([name_show, f"{val:.2f}", logic])
+            if include:
+                valid_prices.append(val)
 
         lines.append(format_table(["方法", "基准价（元）", "计算逻辑"], bl_rows,
                                   alignments=["l", "r", "l"]))
@@ -2964,7 +3106,7 @@ class TushareClient:
         if valid_prices:
             composite = sum(valid_prices) / len(valid_prices)
 
-            lines.append(f"**综合基准价（算术平均）= {composite:.2f} 元**")
+            lines.append(f"**综合基准价（正值方法均值）= {composite:.2f} 元**")
 
             if len(valid_prices) < 3:
                 lines.append("*数据不足（有效方法<3），仅供参考*")
