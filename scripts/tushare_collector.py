@@ -1207,10 +1207,9 @@ class TushareClient:
             lines.append("暂无分红数据\n")
             return "\n".join(lines)
 
-        # Filter for completed dividends
         df_impl = df[df["div_proc"] == "实施"].copy()
+        df_plan = df[df["div_proc"].isin(["董事会预案", "股东大会预案"])].copy()
         
-        # 获取净利润数据用于计算分红率
         income_df = self._get_annual_df("income")
         np_lookup = {}
         if not income_df.empty:
@@ -1220,7 +1219,6 @@ class TushareClient:
                 if np_val is not None and np_val > 0:
                     np_lookup[year] = np_val / 1e6
         
-        # Fallback: 直接从存储中获取（使用原始格式）
         if not np_lookup:
             income_raw = self._store.get("income")
             if income_raw is not None and not income_raw.empty:
@@ -1233,7 +1231,6 @@ class TushareClient:
                         if np_val is not None and np_val > 0:
                             np_lookup[year] = np_val / 1e6
         
-        # Fallback 2: 从母公司利润表获取
         if not np_lookup:
             income_parent_raw = self._store.get("income_parent")
             if income_parent_raw is not None and not income_parent_raw.empty:
@@ -1246,105 +1243,135 @@ class TushareClient:
                         if np_val is not None and np_val > 0:
                             np_lookup[year] = np_val / 1e6
 
-        # 按会计年度分组，区分中期和年度
         df_impl["end_date_str"] = df_impl["end_date"].astype(str)
         df_impl["fiscal_year"] = df_impl["end_date_str"].str[:4]
         df_impl["is_interim"] = df_impl["end_date_str"].str[4:6] == "06"
         
-        # Store for derived metrics
         self._store["dividends_raw"] = df_impl.copy()
 
         if df_impl.empty:
             lines.append("暂无已实施分红\n")
-            return "\n".join(lines)
+        else:
+            lines.append("#### 按会计年度（分红方案归属年度）")
+            lines.append("")
+            headers = ["会计年度", "类型", "每股现金分红(税前)", "登记日", "除权日", "总分红(百万元)", "分红率"]
+            rows = []
+            
+            fiscal_years = sorted(df_impl["fiscal_year"].unique(), reverse=True)[:5]
+            for fy in fiscal_years:
+                fy_df = df_impl[df_impl["fiscal_year"] == fy]
+                for _, r in fy_df.iterrows():
+                    div_type = "中期" if r.get("is_interim") else "年度"
+                    cash_div = r.get("cash_div_tax", 0) or 0
+                    base_share = r.get("base_share", 0) or 0
+                    total_div = cash_div * base_share * 10000 / 1000000
+                    
+                    np_val = np_lookup.get(fy, 0)
+                    payout = (total_div / np_val * 100) if np_val > 0 else 0
+                    
+                    rows.append([
+                        fy,
+                        div_type,
+                        f"{cash_div:.4f}",
+                        str(r.get("record_date", "—")),
+                        str(r.get("ex_date", "—")),
+                        f"{total_div:.2f}",
+                        f"{payout:.2f}%" if payout > 0 else "—",
+                    ])
 
-        # 表1：按会计年度显示分红明细（区分中期/年度）
-        lines.append("#### 按会计年度（分红方案归属年度）")
-        lines.append("")
-        headers = ["会计年度", "类型", "每股现金分红(税前)", "登记日", "除权日", "总分红(百万元)", "分红率"]
-        rows = []
+            table = format_table(headers, rows,
+                                 alignments=["l", "l", "r", "l", "l", "r", "r"])
+            lines.append(table)
+            lines.append("")
         
-        # 按会计年度分组汇总
-        fiscal_years = sorted(df_impl["fiscal_year"].unique(), reverse=True)[:5]
-        for fy in fiscal_years:
-            fy_df = df_impl[df_impl["fiscal_year"] == fy]
-            for _, r in fy_df.iterrows():
-                div_type = "中期" if r.get("is_interim") else "年度"
+        if not df_plan.empty:
+            lines.append("#### 待实施分红预案")
+            lines.append("")
+            df_plan["end_date_str"] = df_plan["end_date"].astype(str)
+            df_plan["fiscal_year"] = df_plan["end_date_str"].str[:4]
+            df_plan["is_interim"] = df_plan["end_date_str"].str[4:6] == "06"
+            
+            plan_headers = ["会计年度", "类型", "每股现金分红(税前)", "预案公告日", "总分红(百万元)", "分红率", "状态"]
+            plan_rows = []
+            for _, r in df_plan.sort_values("end_date", ascending=False).head(3).iterrows():
+                fy = str(r.get("end_date", ""))[:4]
+                div_type = "中期" if str(r.get("end_date", ""))[4:6] == "06" else "年度"
                 cash_div = r.get("cash_div_tax", 0) or 0
                 base_share = r.get("base_share", 0) or 0
-                total_div = cash_div * base_share * 10000 / 1000000  # 转百万元
-                
-                # 计算分红率（用对应会计年度的净利润）
+                total_div = cash_div * base_share * 10000 / 1000000
                 np_val = np_lookup.get(fy, 0)
                 payout = (total_div / np_val * 100) if np_val > 0 else 0
+                proc = r.get("div_proc", "—")
                 
-                rows.append([
+                plan_rows.append([
                     fy,
                     div_type,
                     f"{cash_div:.4f}",
-                    str(r.get("record_date", "—")),
-                    str(r.get("ex_date", "—")),
+                    str(r.get("ann_date", "—")),
                     f"{total_div:.2f}",
                     f"{payout:.2f}%" if payout > 0 else "—",
+                    proc,
                 ])
-
-        table = format_table(headers, rows,
-                             alignments=["l", "l", "r", "l", "l", "r", "r"])
-        lines.append(table)
-        lines.append("")
+            
+            table_plan = format_table(plan_headers, plan_rows,
+                                      alignments=["l", "l", "r", "l", "r", "r", "l"])
+            lines.append(table_plan)
+            lines.append("")
         
-        # 表2：按自然年度（除权日年份）汇总实际实施分红
-        lines.append("#### 按自然年度（实际除权年份）")
-        lines.append("")
-        df_impl["ex_year"] = df_impl["ex_date"].astype(str).str[:4]
-        df_by_ex_year = df_impl.groupby("ex_year").agg({
-            "cash_div_tax": "sum",
-            "stk_div": "sum",
-            "base_share": "first",
-        }).reset_index()
-        df_by_ex_year = df_by_ex_year.sort_values("ex_year", ascending=False).head(5)
+        if df_impl.empty:
+            lines.append("#### 按自然年度（实际除权年份）")
+            lines.append("")
+            lines.append("暂无数据\n")
+            df_by_ex_year = pd.DataFrame()
+        else:
+            lines.append("#### 按自然年度（实际除权年份）")
+            lines.append("")
+            df_impl["ex_year"] = df_impl["ex_date"].astype(str).str[:4]
+            df_by_ex_year = df_impl.groupby("ex_year").agg({
+                "cash_div_tax": "sum",
+                "stk_div": "sum",
+                "base_share": "first",
+            }).reset_index()
+            df_by_ex_year = df_by_ex_year.sort_values("ex_year", ascending=False).head(5)
+            
+            headers2 = ["自然年度", "累计每股分红(税前)", "分红次数", "总分红(百万元)"]
+            rows2 = []
+            for _, r in df_by_ex_year.iterrows():
+                ex_year = r["ex_year"]
+                cash_div = r.get("cash_div_tax", 0) or 0
+                base_share = r.get("base_share", 0) or 0
+                count = len(df_impl[df_impl["ex_year"] == ex_year])
+                total_div = cash_div * base_share * 10000 / 1000000
+                rows2.append([
+                    ex_year,
+                    f"{cash_div:.4f}",
+                    str(count),
+                    f"{total_div:.2f}",
+                ])
+            
+            table2 = format_table(headers2, rows2,
+                                  alignments=["l", "r", "r", "r"])
+            lines.append(table2)
+            lines.append("")
         
-        headers2 = ["自然年度", "累计每股分红(税前)", "分红次数", "总分红(百万元)"]
-        rows2 = []
-        for _, r in df_by_ex_year.iterrows():
-            ex_year = r["ex_year"]
-            cash_div = r.get("cash_div_tax", 0) or 0
-            base_share = r.get("base_share", 0) or 0
-            count = len(df_impl[df_impl["ex_year"] == ex_year])
-            total_div = cash_div * base_share * 10000 / 1000000
-            rows2.append([
-                ex_year,
-                f"{cash_div:.4f}",
-                str(count),
-                f"{total_div:.2f}",
-            ])
-        
-        table2 = format_table(headers2, rows2,
-                              alignments=["l", "r", "r", "r"])
-        lines.append(table2)
-        lines.append("")
-        
-        # 表3：股息率计算（TTM口径）
         lines.append("#### 股息率计算（TTM口径）")
         lines.append("")
         
-        # 获取当前股价
         quote_df = self._store.get("daily_quote")
         latest_price = 0
         if quote_df is not None and not quote_df.empty:
             latest_price = self._safe_float(quote_df.iloc[0].get("close")) or 0
         
-        # 计算TTM分红（过去12个月已实施）
-        df_impl["ex_date_dt"] = pd.to_datetime(df_impl["ex_date"], format="%Y%m%d", errors="coerce")
-        latest_date = df_impl["ex_date_dt"].max()
-        if pd.notna(latest_date):
-            ttm_start = latest_date - pd.DateOffset(years=1)
-            ttm_df = df_impl[df_impl["ex_date_dt"] >= ttm_start]
-            ttm_dps = ttm_df["cash_div_tax"].sum()
-            ttm_yield = (ttm_dps / latest_price * 100) if latest_price > 0 else 0
-        else:
-            ttm_dps = 0
-            ttm_yield = 0
+        ttm_dps = 0
+        ttm_yield = 0
+        if not df_impl.empty:
+            df_impl["ex_date_dt"] = pd.to_datetime(df_impl["ex_date"], format="%Y%m%d", errors="coerce")
+            latest_date = df_impl["ex_date_dt"].max()
+            if pd.notna(latest_date):
+                ttm_start = latest_date - pd.DateOffset(years=1)
+                ttm_df = df_impl[df_impl["ex_date_dt"] >= ttm_start]
+                ttm_dps = ttm_df["cash_div_tax"].sum()
+                ttm_yield = (ttm_dps / latest_price * 100) if latest_price > 0 else 0
         
         lines.append(f"| 指标 | 数值 | 口径说明 |")
         lines.append(f"| --- | ---: | --- |")
@@ -1354,13 +1381,29 @@ class TushareClient:
             lines.append(f"| 当前股价 | {latest_price:.2f}元 | 最新收盘价 |")
         lines.append("")
         
+        if not df_plan.empty:
+            plan_dps = df_plan["cash_div_tax"].sum()
+            plan_yield = (plan_dps / latest_price * 100) if latest_price > 0 else 0
+            total_dps = ttm_dps + plan_dps
+            total_yield = (total_dps / latest_price * 100) if latest_price > 0 else 0
+            
+            lines.append("#### 预期股息率（含预案）")
+            lines.append("")
+            lines.append(f"| 指标 | 数值 | 口径说明 |")
+            lines.append(f"| --- | ---: | --- |")
+            lines.append(f"| 预案每股分红 | {plan_dps:.4f}元 | 待实施分红预案合计 |")
+            lines.append(f"| 预期股息率 | {total_yield:.2f}% | (TTM分红+预案分红)/当前股价 |")
+            lines.append("")
+        
         lines.append("> **口径说明**：")
         lines.append("> - 分红率 = 分红金额 / 对应会计年度归母净利润（证监会法定口径）")
         lines.append("> - TTM股息率 = 过去12个月已实施分红 / 当前股价（行业通用口径）")
+        lines.append("> - 预期股息率 = (TTM分红 + 待实施预案分红) / 当前股价（含预期分红）")
         lines.append("> - 中期分红率 ≠ 公司公告的中期分红率（公司用上半年净利润，此处用全年净利润）")
         
-        # Store for derived metrics - 使用自然年度汇总数据
-        self._store["dividends_by_ex_year"] = df_by_ex_year
+        self._store["dividends_by_ex_year"] = df_by_ex_year if not df_impl.empty else pd.DataFrame()
+        self._store["dividends"] = df_impl if not df_impl.empty else pd.DataFrame()
+        self._store["dividends_plan"] = df_plan if not df_plan.empty else pd.DataFrame()
         
         return "\n".join(lines)
 
@@ -1672,6 +1715,10 @@ class TushareClient:
         table = format_table(headers, rows,
                              alignments=["l"] + ["r"] * len(years))
         lines.append(table)
+        lines.append("")
+        lines.append("> **口径说明**：")
+        lines.append("> - ROE = 净利润 / 期末净资产（简单ROE，非法定披露口径）")
+        lines.append("> - 加权ROE = 加权平均净资产收益率（证监会法定披露口径）")
         return "\n".join(lines)
 
     def _get_fina_indicators_hk(self, ts_code: str) -> str:
